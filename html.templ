@@ -1,0 +1,269 @@
+package main
+
+import "fmt"
+
+// page is the master layout. The body connects to the global /events SSE stream
+// so that any element with hx-trigger="sse:devices" refreshes itself.
+templ page(title string, body templ.Component) {
+	<!DOCTYPE html>
+	<html lang="en">
+		<head>
+			<meta charset="utf-8"/>
+			<meta name="viewport" content="width=device-width, initial-scale=1"/>
+			<title>{ title } · picohub</title>
+			<script src="https://unpkg.com/htmx.org@1.9.12"></script>
+			<script src="https://unpkg.com/htmx.org@1.9.12/dist/ext/sse.js"></script>
+			@pageStyle()
+		</head>
+		<body hx-ext="sse" sse-connect="/events">
+			<nav>
+				<a href="/" class="brand">picohub</a>
+				<span class="sub">USB board manager</span>
+			</nav>
+			<main class="container">
+				@body
+			</main>
+		</body>
+	</html>
+}
+
+// dashboard lists every known device; the list refreshes on sse:devices.
+templ dashboard(devices []DeviceView) {
+	<div class="section-header">
+		<h1>Devices</h1>
+	</div>
+	<div id="device-list" hx-get="/partials/devices" hx-trigger="sse:devices" hx-swap="innerHTML">
+		@deviceList(devices)
+	</div>
+}
+
+templ deviceList(devices []DeviceView) {
+	if len(devices) == 0 {
+		<p class="muted">No boards detected. Plug in a Pico, Pico2, or ESP32 board.</p>
+	} else {
+		<div class="cards">
+			for _, d := range devices {
+				@deviceCard(d)
+			}
+		</div>
+	}
+}
+
+templ deviceCard(d DeviceView) {
+	<a class="card" href={ templ.SafeURL("/devices/" + d.ID) }>
+		<div class="card-head">
+			<span class="name">{ deviceName(d) }</span>
+			@stateBadge(d.State)
+		</div>
+		<div class="meta">
+			@targetBadge(d.Target)
+			<span class="mono">{ d.VIDPID() }</span>
+			if d.Present {
+				<span class="mono">{ d.Port }</span>
+			}
+		</div>
+		if d.LastErr != "" {
+			<div class="err">last error: { d.LastErr }</div>
+		}
+	</a>
+}
+
+// devicePage is the per-board detail view with live console + flashing controls.
+templ devicePage(d DeviceView, sessions []Session, flashes []FlashRecord) {
+	<div class="section-header">
+		<h1>{ deviceName(d) }</h1>
+		<a href="/" class="muted">&larr; all devices</a>
+	</div>
+
+	<div id="device-status" hx-get={ "/partials/devices/" + d.ID + "/status" } hx-trigger="sse:devices" hx-swap="innerHTML">
+		@deviceStatus(d)
+	</div>
+
+	<div class="grid">
+		<section class="panel">
+			<h2>Console</h2>
+			<div hx-ext="sse" sse-connect={ "/devices/" + d.ID + "/console" }>
+				<pre id="console" class="console">{ d.RingText }</pre>
+				<div id="console-sink" sse-swap="console" hx-swap="beforeend" hx-target="#console"></div>
+				<div id="flash-log" class="flash-log" sse-swap="flash" hx-swap="beforeend"></div>
+			</div>
+			<form class="row" hx-post={ "/devices/" + d.ID + "/send" } hx-swap="none">
+				<input type="text" name="line" placeholder="send a line to the board..." autocomplete="off"/>
+				<button type="submit">Send</button>
+			</form>
+		</section>
+
+		<section class="panel">
+			<h2>Flash</h2>
+			if d.Target.IsESP() {
+				<p class="muted">ESP flashing is not yet supported (Phase 2). Console monitoring works.</p>
+			} else {
+				<form hx-post={ "/devices/" + d.ID + "/flash" } hx-encoding="multipart/form-data" hx-swap="none" class="col">
+					<input type="file" name="firmware" accept=".uf2" required/>
+					<button type="submit">Flash firmware (.uf2)</button>
+				</form>
+			}
+			<form hx-post={ "/devices/" + d.ID + "/bootmode" } hx-swap="none" class="col">
+				<button type="submit" class="secondary">Enter boot mode</button>
+			</form>
+			<form hx-post={ "/devices/" + d.ID + "/rename" } hx-swap="none" class="row">
+				<input type="text" name="name" placeholder="rename device..." value={ d.Name }/>
+				<button type="submit" class="secondary">Rename</button>
+			</form>
+		</section>
+	</div>
+
+	<section class="panel">
+		<h2>Logs</h2>
+		@sessionTable(d.ID, sessions)
+	</section>
+
+	<section class="panel">
+		<h2>Flash history</h2>
+		@flashTable(flashes)
+	</section>
+}
+
+templ deviceStatus(d DeviceView) {
+	<div class="status">
+		@stateBadge(d.State)
+		@targetBadge(d.Target)
+		<span class="mono">{ d.VIDPID() }</span>
+		if d.Present {
+			<span class="mono">{ d.Port }</span>
+		} else {
+			<span class="muted">disconnected</span>
+		}
+		if d.LastErr != "" {
+			<span class="err">{ d.LastErr }</span>
+		}
+	</div>
+}
+
+templ sessionTable(deviceID string, sessions []Session) {
+	if len(sessions) == 0 {
+		<p class="muted">No log sessions yet.</p>
+	} else {
+		<table>
+			<thead><tr><th>#</th><th>started</th><th>ended</th><th>bytes</th><th></th></tr></thead>
+			<tbody>
+				for _, s := range sessions {
+					<tr>
+						<td>{ fmt.Sprintf("%d", s.Seq) }</td>
+						<td class="mono">{ fmtTime(s.StartedAt) }</td>
+						<td class="mono">
+							if s.Active() {
+								<span class="live">live</span>
+							} else {
+								{ fmtTime(s.EndedAt) }
+							}
+						</td>
+						<td class="mono">{ fmt.Sprintf("%d", s.ByteLen) }</td>
+						<td><a href={ templ.SafeURL("/devices/" + deviceID + "/logs/" + s.ID) }>view</a></td>
+					</tr>
+				}
+			</tbody>
+		</table>
+	}
+}
+
+templ flashTable(flashes []FlashRecord) {
+	if len(flashes) == 0 {
+		<p class="muted">No flashes yet.</p>
+	} else {
+		<table>
+			<thead><tr><th>when</th><th>firmware</th><th>size</th><th>result</th></tr></thead>
+			<tbody>
+				for _, f := range flashes {
+					<tr>
+						<td class="mono">{ fmtTime(f.At) }</td>
+						<td>{ f.Firmware }</td>
+						<td class="mono">{ fmt.Sprintf("%d", f.Size) }</td>
+						<td>
+							if f.OK {
+								<span class="ok">ok ({ fmt.Sprintf("%dms", f.DurationMs) })</span>
+							} else {
+								<span class="err">{ f.Err }</span>
+							}
+						</td>
+					</tr>
+				}
+			</tbody>
+		</table>
+	}
+}
+
+// logPage shows a single session's captured serial output.
+templ logPage(d DeviceView, sess Session, content string) {
+	<div class="section-header">
+		<h1>{ deviceName(d) } · session #{ fmt.Sprintf("%d", sess.Seq) }</h1>
+		<a href={ templ.SafeURL("/devices/" + d.ID) } class="muted">&larr; back to device</a>
+	</div>
+	<div class="meta">
+		<span class="mono">started { fmtTime(sess.StartedAt) }</span>
+		<span class="mono">{ fmt.Sprintf("%d bytes", sess.ByteLen) }</span>
+		<a href={ templ.SafeURL("/devices/" + d.ID + "/logs/" + sess.ID + "/raw") }>download raw</a>
+	</div>
+	<pre class="console">{ content }</pre>
+}
+
+templ stateBadge(s DevState) {
+	switch s {
+		case StateMonitoring:
+			<span class="badge ok">monitoring</span>
+		case StateFlashing:
+			<span class="badge warn">flashing</span>
+		default:
+			<span class="badge muted">absent</span>
+	}
+}
+
+templ targetBadge(t Target) {
+	<span class="badge target">{ t.String() }</span>
+}
+
+templ pageStyle() {
+	<style>
+		* { box-sizing: border-box; }
+		body { margin: 0; font-family: ui-sans-serif, system-ui, sans-serif; background: #0f1115; color: #e6e6e6; }
+		.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #9aa4b2; }
+		.muted { color: #7a8290; }
+		nav { display: flex; align-items: baseline; gap: 12px; padding: 12px 20px; background: #161922; border-bottom: 1px solid #232838; }
+		nav .brand { font-weight: 700; color: #fff; text-decoration: none; font-size: 18px; }
+		nav .sub { color: #7a8290; font-size: 13px; }
+		.container { max-width: 1000px; margin: 0 auto; padding: 20px; }
+		.section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+		h1 { font-size: 22px; margin: 0; }
+		h2 { font-size: 15px; margin: 0 0 10px; color: #c7d0dc; }
+		a { color: #6ea8fe; }
+		.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+		.card { display: block; padding: 14px; background: #161922; border: 1px solid #232838; border-radius: 8px; text-decoration: none; color: inherit; }
+		.card:hover { border-color: #38415a; }
+		.card-head { display: flex; justify-content: space-between; align-items: center; }
+		.card .name { font-weight: 600; }
+		.meta { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+		.status { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 10px 0; }
+		.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0; }
+		@media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+		.panel { padding: 16px; background: #161922; border: 1px solid #232838; border-radius: 8px; margin-bottom: 16px; }
+		.console { background: #0a0c10; border: 1px solid #232838; border-radius: 6px; padding: 10px; height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-all; font-family: ui-monospace, monospace; font-size: 12px; color: #cfe3cf; margin: 0; }
+		.flash-log { font-family: ui-monospace, monospace; font-size: 12px; color: #e0b24c; margin-top: 6px; }
+		.row { display: flex; gap: 8px; margin-top: 10px; }
+		.col { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+		input[type=text] { flex: 1; padding: 8px; background: #0a0c10; border: 1px solid #232838; border-radius: 6px; color: #e6e6e6; }
+		input[type=file] { color: #9aa4b2; }
+		button { padding: 8px 14px; background: #2563eb; color: #fff; border: 0; border-radius: 6px; cursor: pointer; font-weight: 600; }
+		button.secondary { background: #2b3142; }
+		button:hover { filter: brightness(1.1); }
+		.badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
+		.badge.ok, .ok { color: #34d399; }
+		.badge.warn, .warn { color: #fbbf24; }
+		.badge.muted { color: #7a8290; }
+		.badge.target { background: #232838; color: #9bb0d4; }
+		.err { color: #f87171; font-size: 12px; }
+		.live { color: #34d399; font-weight: 600; }
+		table { width: 100%; border-collapse: collapse; font-size: 13px; }
+		th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #232838; }
+		th { color: #7a8290; font-weight: 600; }
+	</style>
+}
