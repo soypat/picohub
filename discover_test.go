@@ -95,3 +95,50 @@ func TestDiscovererScan(t *testing.T) {
 		t.Errorf("cp2102 fallback ID wrong: %q", cp.ID)
 	}
 }
+
+// writeUSBBusDev creates a fake /sys/bus/usb/devices entry for a raw USB device
+// (no tty), as a BOOTSEL board appears.
+func writeUSBBusDev(t *testing.T, bus, name, vid, pid, serial string) {
+	t.Helper()
+	dir := filepath.Join(bus, name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for n, v := range map[string]string{"idVendor": vid, "idProduct": pid, "serial": serial} {
+		if v == "" {
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(dir, n), []byte(v+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestScanBootsel(t *testing.T) {
+	bus := t.TempDir()
+	writeUSBBusDev(t, bus, "1-10", "2e8a", "0003", "E0C9125B0D9B") // RP2040 BOOTSEL
+	writeUSBBusDev(t, bus, "1-10:1.0", "2e8a", "0003", "")         // its interface -> skipped
+	writeUSBBusDev(t, bus, "2-1", "2e8a", "0005", "RUN123")        // CDC (running) -> not bootsel
+	writeUSBBusDev(t, bus, "usb1", "1d6b", "0002", "")             // root hub -> skipped
+
+	d := &discoverer{sysClassTTY: t.TempDir(), devDir: "/dev", sysBusUSB: bus}
+	got, err := d.scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 bootsel device, got %d: %+v", len(got), got)
+	}
+	b := got[0]
+	if !b.BootSel || b.ID != "E0C9125B0D9B" || b.Target != TargetPico || b.Port != "" {
+		t.Errorf("bootsel descriptor wrong: %+v", b)
+	}
+}
+
+// A discoverer with sysBusUSB unset must not scan the host's real USB tree.
+func TestScanBootselDisabled(t *testing.T) {
+	d := &discoverer{sysClassTTY: t.TempDir(), devDir: "/dev"}
+	if got := d.scanBootsel(); got != nil {
+		t.Errorf("expected nil with sysBusUSB unset, got %+v", got)
+	}
+}

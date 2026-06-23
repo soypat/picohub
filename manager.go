@@ -22,6 +22,7 @@ const (
 	StateAbsent     DevState = iota // not enumerated on the bus
 	StateMonitoring                 // present, console pump running
 	StateFlashing                   // a flash is in progress (board may be off-bus)
+	StateBootsel                    // present in BOOTSEL mass-storage mode, ready to flash (no console)
 )
 
 func (s DevState) String() string {
@@ -30,6 +31,8 @@ func (s DevState) String() string {
 		return "monitoring"
 	case StateFlashing:
 		return "flashing"
+	case StateBootsel:
+		return "bootsel"
 	default:
 		return "absent"
 	}
@@ -141,10 +144,16 @@ func (m *Manager) reconcile(ctx context.Context) {
 			// flash routine restores monitoring afterwards.
 			continue
 		case StateAbsent:
-			if m.startMonitoring(ctx, md, desc) {
+			ok := false
+			if desc.BootSel {
+				ok = m.registerBootsel(md, desc)
+			} else {
+				ok = m.startMonitoring(ctx, md, desc)
+			}
+			if ok {
 				changed = true
 			}
-		default: // monitoring: refresh the live port
+		default: // monitoring/bootsel: refresh the live port
 			md.mu.Lock()
 			md.desc.Port = desc.Port
 			md.desc.LastSeen = time.Now()
@@ -152,7 +161,7 @@ func (m *Manager) reconcile(ctx context.Context) {
 		}
 	}
 
-	// Devices that vanished while monitoring: stop and mark absent.
+	// Devices that vanished: stop the pump / clear bootsel and mark absent.
 	m.mu.Lock()
 	all := make([]*managed, 0, len(m.devices))
 	ids := make([]string, 0, len(m.devices))
@@ -165,8 +174,12 @@ func (m *Manager) reconcile(ctx context.Context) {
 		if _, ok := present[ids[i]]; ok {
 			continue
 		}
-		if md.snapshotState() == StateMonitoring {
+		switch md.snapshotState() {
+		case StateMonitoring:
 			m.stopMonitoring(md)
+			changed = true
+		case StateBootsel:
+			m.clearBootsel(md)
 			changed = true
 		}
 	}
@@ -221,6 +234,45 @@ func (m *Manager) startMonitoring(ctx context.Context, md *managed, desc Descrip
 	go m.pump(md, dev, stop, done, ring, sess.LogFile, consoleEvent(desc.ID))
 	slog.Info("monitoring", "device", desc.ID, "port", desc.Port, "target", desc.Target)
 	return true
+}
+
+// registerBootsel records a board found in BOOTSEL mode as a present,
+// flashable device. There is no console to pump, so no session is started.
+func (m *Manager) registerBootsel(md *managed, desc Descriptor) bool {
+	md.ctrl.Lock()
+	defer md.ctrl.Unlock()
+	if md.snapshotState() != StateAbsent {
+		return false
+	}
+
+	rec, _ := m.store.DeviceSeen(desc.ID, time.Now())
+	desc.Name = rec.Name
+	if rec.TargetOverride != TargetUnknown {
+		desc.Target = rec.TargetOverride
+	}
+
+	md.mu.Lock()
+	md.desc = desc
+	md.dev = newDevice(desc)
+	md.state = StateBootsel
+	md.lastErr = ""
+	md.mu.Unlock()
+	slog.Info("bootsel", "device", desc.ID, "target", desc.Target)
+	return true
+}
+
+// clearBootsel marks a vanished BOOTSEL device absent (it rebooted into its
+// firmware, or was unplugged).
+func (m *Manager) clearBootsel(md *managed) {
+	md.ctrl.Lock()
+	defer md.ctrl.Unlock()
+	md.mu.Lock()
+	if md.state == StateBootsel {
+		md.state = StateAbsent
+		md.dev = nil
+	}
+	md.mu.Unlock()
+	slog.Info("bootsel gone", "device", md.desc.ID)
 }
 
 // stopMonitoring stops the pump and ends the session (ctrl held across the wait).

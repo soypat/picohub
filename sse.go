@@ -2,10 +2,19 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
+
+// sseHeartbeat is how often Serve writes a comment frame to a quiet connection.
+// It exists to detect clients that vanished on navigation: Go only reports a
+// dead peer when a write fails, so without periodic writes an idle stream
+// leaks until the TCP retransmit timeout (~30s+) and ties up one of the
+// browser's ~6 per-origin connection slots in the meantime.
+const sseHeartbeat = 15 * time.Second
 
 // sseMessage is a single Server-Sent Event: Event is matched by HTMX's
 // sse-swap="<Event>" attribute, Data is the (already HTML-safe) payload.
@@ -80,8 +89,13 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request) {
 	defer unsub()
 
 	// Tell the client to retry quickly if the connection drops.
-	fmt.Fprint(w, "retry: 1000\n\n")
+	if _, err := fmt.Fprint(w, "retry: 1000\n\n"); err != nil {
+		return
+	}
 	flusher.Flush()
+
+	heartbeat := time.NewTicker(sseHeartbeat)
+	defer heartbeat.Stop()
 
 	ctx := r.Context()
 	for {
@@ -89,20 +103,32 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case msg := <-ch:
-			writeSSE(w, msg)
+			if err := writeSSE(w, msg); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-heartbeat.C:
+			// A failed write here reaps a client that left on navigation.
+			if _, err := fmt.Fprint(w, ": heartbeat\n\n"); err != nil {
+				return
+			}
 			flusher.Flush()
 		}
 	}
 }
 
 // writeSSE emits one event frame. Multi-line data is split into multiple
-// "data:" lines per the SSE spec.
-func writeSSE(w http.ResponseWriter, msg sseMessage) {
+// "data:" lines per the SSE spec. It returns the write error so a dead client
+// ends the stream rather than leaking the connection.
+func writeSSE(w http.ResponseWriter, msg sseMessage) error {
+	var b strings.Builder
 	if msg.Event != "" {
-		fmt.Fprintf(w, "event: %s\n", msg.Event)
+		fmt.Fprintf(&b, "event: %s\n", msg.Event)
 	}
 	for _, line := range strings.Split(msg.Data, "\n") {
-		fmt.Fprintf(w, "data: %s\n", line)
+		fmt.Fprintf(&b, "data: %s\n", line)
 	}
-	fmt.Fprint(w, "\n")
+	b.WriteString("\n")
+	_, err := io.WriteString(w, b.String())
+	return err
 }

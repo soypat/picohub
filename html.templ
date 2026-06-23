@@ -15,7 +15,7 @@ templ page(title string, body templ.Component) {
 			<script src="https://unpkg.com/htmx.org@1.9.12/dist/ext/sse.js"></script>
 			@pageStyle()
 		</head>
-		<body hx-ext="sse" sse-connect="/events">
+		<body hx-ext="sse" sse-connect="/events" sse-close="close">
 			<nav>
 				<a href="/" class="brand">picohub</a>
 				<span class="sub">USB board manager</span>
@@ -23,8 +23,39 @@ templ page(title string, body templ.Component) {
 			<main class="container">
 				@body
 			</main>
+			@sseLifecycleScript()
 		</body>
 	</html>
+}
+
+// sseLifecycleScript tears down the SSE EventSource so it never leaks a
+// connection. Two failure modes exhaust the browser's ~6-per-origin connection
+// limit and hang the UI, both handled here:
+//
+//   - Navigation: browsers do NOT close SSE connections when leaving a page,
+//     and removing the sse-connect attribute does not close them either — only
+//     EventSource.close() does. Closed on pagehide.
+//   - Reconnect storm: htmx's SSE extension automatically opens a *new*
+//     EventSource on any error. Near the connection limit this cascades. We
+//     stop it by closing on htmx:sseError/sseClose and removing sse-connect so
+//     htmx does not reconnect.
+templ sseLifecycleScript() {
+	<script>
+		(function () {
+			var sse = null;
+			function closeSSE(reason, permanent) {
+				if (sse) { sse.close(); sse = null; }
+				// Removing the attribute stops htmx from auto-reconnecting.
+				if (permanent) { document.body.removeAttribute("sse-connect"); }
+			}
+			document.body.addEventListener("htmx:sseOpen", function (e) {
+				sse = e.detail.source; // the EventSource htmx opened
+			});
+			document.body.addEventListener("htmx:sseError", function () { closeSSE("error", true); });
+			document.body.addEventListener("htmx:sseClose", function () { closeSSE("close", true); });
+			window.addEventListener("pagehide", function () { closeSSE("pagehide", true); });
+		})();
+	</script>
 }
 
 // dashboard lists every known device; the list refreshes on sse:devices.
@@ -234,6 +265,8 @@ templ stateBadge(s DevState) {
 			<span class="badge ok">monitoring</span>
 		case StateFlashing:
 			<span class="badge warn">flashing</span>
+		case StateBootsel:
+			<span class="badge warn">BOOTSEL</span>
 		default:
 			<span class="badge muted">absent</span>
 	}

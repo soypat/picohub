@@ -62,6 +62,7 @@ type Descriptor struct {
 	PID      uint16    // USB product id, e.g. 0x0005
 	Name     string    // user-assigned label (from Store), may be empty
 	Present  bool      // currently enumerated on the bus
+	BootSel  bool      // enumerated in RP2 BOOTSEL mass-storage mode (no console)
 	LastSeen time.Time // last time the device was observed present
 }
 
