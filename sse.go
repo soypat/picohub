@@ -14,53 +14,49 @@ type sseMessage struct {
 	Data  string
 }
 
-// Hub is a minimal topic-based SSE fan-out. Topics are arbitrary strings;
-// "events" carries global device-list/state changes, "console:<id>" carries a
-// device's live serial output.
+// Hub is a minimal SSE fan-out: every client subscribes to one global stream
+// and routing is done by event name rather than by connection. The "devices"
+// event carries device-list/state changes; "console:<id>" and "flash:<id>"
+// carry a single device's live output. Each page reacts only to the event
+// names it declares via sse-swap, so one connection serves the whole UI.
 type Hub struct {
 	mu   sync.Mutex
-	subs map[string]map[chan sseMessage]struct{}
+	subs map[chan sseMessage]struct{}
 }
 
 func NewHub() *Hub {
-	return &Hub{subs: make(map[string]map[chan sseMessage]struct{})}
+	return &Hub{subs: make(map[chan sseMessage]struct{})}
 }
 
-// topicConsole returns the per-device console topic name.
-func topicConsole(deviceID string) string { return "console:" + deviceID }
+// SSE event names. Per-device events are namespaced by id so a page can swap
+// only its own device's output off the shared stream.
+const eventDevices = "devices"
 
-const topicEvents = "events"
+func consoleEvent(deviceID string) string { return "console:" + deviceID }
+func flashEvent(deviceID string) string   { return "flash:" + deviceID }
 
-// Subscribe registers a buffered channel on a topic and returns it plus an
+// Subscribe registers a buffered channel on the stream and returns it plus an
 // unsubscribe function.
-func (h *Hub) Subscribe(topic string) (<-chan sseMessage, func()) {
+func (h *Hub) Subscribe() (<-chan sseMessage, func()) {
 	ch := make(chan sseMessage, 256)
 	h.mu.Lock()
-	if h.subs[topic] == nil {
-		h.subs[topic] = make(map[chan sseMessage]struct{})
-	}
-	h.subs[topic][ch] = struct{}{}
+	h.subs[ch] = struct{}{}
 	h.mu.Unlock()
 
 	return ch, func() {
 		h.mu.Lock()
-		if set := h.subs[topic]; set != nil {
-			delete(set, ch)
-			if len(set) == 0 {
-				delete(h.subs, topic)
-			}
-		}
+		delete(h.subs, ch)
 		h.mu.Unlock()
 		close(ch)
 	}
 }
 
-// Publish delivers msg to every subscriber of topic. Slow subscribers that have
-// filled their buffer are skipped (dropped messages) rather than blocking.
-func (h *Hub) Publish(topic string, msg sseMessage) {
+// Publish delivers msg to every subscriber. Slow subscribers that have filled
+// their buffer are skipped (dropped messages) rather than blocking.
+func (h *Hub) Publish(msg sseMessage) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for ch := range h.subs[topic] {
+	for ch := range h.subs {
 		select {
 		case ch <- msg:
 		default:
@@ -68,9 +64,9 @@ func (h *Hub) Publish(topic string, msg sseMessage) {
 	}
 }
 
-// ServeTopic streams a topic to an HTTP client as text/event-stream until the
-// request is cancelled.
-func (h *Hub) ServeTopic(w http.ResponseWriter, r *http.Request, topic string) {
+// Serve streams the global event stream to an HTTP client as text/event-stream
+// over a single connection until the request is cancelled.
+func (h *Hub) Serve(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -80,7 +76,7 @@ func (h *Hub) ServeTopic(w http.ResponseWriter, r *http.Request, topic string) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	ch, unsub := h.Subscribe(topic)
+	ch, unsub := h.Subscribe()
 	defer unsub()
 
 	// Tell the client to retry quickly if the connection drops.

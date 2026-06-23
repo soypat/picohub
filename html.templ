@@ -82,11 +82,10 @@ templ devicePage(d DeviceView, sessions []Session, flashes []FlashRecord) {
 	<div class="grid">
 		<section class="panel">
 			<h2>Console</h2>
-			<div hx-ext="sse" sse-connect={ "/devices/" + d.ID + "/console" }>
-				<pre id="console" class="console">{ d.RingText }</pre>
-				<div id="console-sink" sse-swap="console" hx-swap="beforeend" hx-target="#console"></div>
-				<div id="flash-log" class="flash-log" sse-swap="flash" hx-swap="beforeend"></div>
-			</div>
+			<pre id="console" class="console">{ d.RingText }</pre>
+			<div id="console-sink" sse-swap={ consoleEvent(d.ID) } hx-swap="beforeend" hx-target="#console"></div>
+			<div id="flash-log" class="flash-log" sse-swap={ flashEvent(d.ID) } hx-swap="beforeend"></div>
+			@consoleFollowScript()
 			<form class="row" hx-post={ "/devices/" + d.ID + "/send" } hx-swap="none">
 				<input type="text" name="line" placeholder="send a line to the board..." autocomplete="off"/>
 				<button type="submit">Send</button>
@@ -122,6 +121,28 @@ templ devicePage(d DeviceView, sessions []Session, flashes []FlashRecord) {
 		<h2>Flash history</h2>
 		@flashTable(flashes)
 	</section>
+}
+
+// consoleFollowScript keeps the console scrolled to the newest output as it
+// streams in (tail-follow). Following pauses automatically when the user
+// scrolls up to read history and resumes once they return to the bottom.
+templ consoleFollowScript() {
+	<script>
+		(function () {
+			var c = document.getElementById("console");
+			if (!c) return;
+			var SLACK = 24; // px tolerance for counting as "at the bottom"
+			var atBottom = function () {
+				return c.scrollTop + c.clientHeight >= c.scrollHeight - SLACK;
+			};
+			var stick = true;
+			c.addEventListener("scroll", function () { stick = atBottom(); });
+			document.body.addEventListener("htmx:afterSwap", function () {
+				if (stick) c.scrollTop = c.scrollHeight;
+			});
+			c.scrollTop = c.scrollHeight; // start pinned to the latest line
+		})();
+	</script>
 }
 
 templ deviceStatus(d DeviceView) {

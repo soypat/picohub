@@ -37,7 +37,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /devices/{id}/logs/{sid}", s.handleLog)
 	mux.HandleFunc("GET /devices/{id}/logs/{sid}/raw", s.handleLogRaw)
 	mux.HandleFunc("GET /events", s.handleEvents)
-	mux.HandleFunc("GET /devices/{id}/console", s.handleConsole)
 	return mux
 }
 
@@ -84,6 +83,13 @@ func (s *Server) handleDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sessions, _ := s.store.Sessions(id)
+	// The active session's byte count is only persisted when it ends, so the
+	// stored copy reads 0 while live. Overlay the manager's live count.
+	for i := range sessions {
+		if sessions[i].ID == d.Session.ID {
+			sessions[i].ByteLen = d.Session.ByteLen
+		}
+	}
 	flashes, _ := s.store.Flashes(id)
 	s.render(w, r, deviceName(d), devicePage(d, sessions, flashes))
 }
@@ -99,6 +105,9 @@ func (s *Server) handleLog(w http.ResponseWriter, r *http.Request) {
 	if !found || sess.DeviceID != id {
 		http.NotFound(w, r)
 		return
+	}
+	if sess.ID == d.Session.ID {
+		sess.ByteLen = d.Session.ByteLen // live count; store lags until the session ends
 	}
 	content, _ := os.ReadFile(sess.LogFile)
 	s.render(w, r, "log", logPage(d, sess, string(content)))
@@ -194,18 +203,14 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.hub.Publish(topicEvents, sseMessage{Event: "devices"})
+	s.hub.Publish(sseMessage{Event: eventDevices})
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- SSE handlers ----------------------------------------------------------
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	s.hub.ServeTopic(w, r, topicEvents)
-}
-
-func (s *Server) handleConsole(w http.ResponseWriter, r *http.Request) {
-	s.hub.ServeTopic(w, r, topicConsole(r.PathValue("id")))
+	s.hub.Serve(w, r)
 }
 
 // validateUF2 confirms the uploaded file decodes as a UF2 image.

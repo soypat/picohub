@@ -172,7 +172,7 @@ func (m *Manager) reconcile(ctx context.Context) {
 	}
 
 	if changed {
-		m.hub.Publish(topicEvents, sseMessage{Event: "devices"})
+		m.hub.Publish(sseMessage{Event: eventDevices})
 	}
 }
 
@@ -218,7 +218,7 @@ func (m *Manager) startMonitoring(ctx context.Context, md *managed, desc Descrip
 	ring := md.ring
 	md.mu.Unlock()
 
-	go m.pump(md, dev, stop, done, ring, sess.LogFile, topicConsole(desc.ID))
+	go m.pump(md, dev, stop, done, ring, sess.LogFile, consoleEvent(desc.ID))
 	slog.Info("monitoring", "device", desc.ID, "port", desc.Port, "target", desc.Target)
 	return true
 }
@@ -261,7 +261,7 @@ func (m *Manager) teardownLocked(md *managed) {
 
 // pump reads the console, appends to the log + ring, and broadcasts to SSE. It
 // owns logf for the lifetime of the read loop and acquires no manager locks.
-func (m *Manager) pump(md *managed, dev Device, stop, done chan struct{}, ring *ringBuffer, logFile, topic string) {
+func (m *Manager) pump(md *managed, dev Device, stop, done chan struct{}, ring *ringBuffer, logFile, consoleEv string) {
 	defer close(done)
 	// Reopen the log file independently so the pump owns its handle.
 	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -284,7 +284,7 @@ func (m *Manager) pump(md *managed, dev Device, stop, done chan struct{}, ring *
 			_, _ = f.Write(chunk)
 			ring.Write(chunk)
 			md.byteLen.Add(int64(n))
-			m.hub.Publish(topic, sseMessage{Event: "console", Data: html.EscapeString(string(chunk))})
+			m.hub.Publish(sseMessage{Event: consoleEv, Data: html.EscapeString(string(chunk))})
 		}
 		if rerr != nil {
 			slog.Debug("console read ended", "device", md.desc.ID, "err", rerr)
@@ -319,9 +319,9 @@ func (m *Manager) Flash(ctx context.Context, id, fwPath, fwName string) error {
 	md.state = StateFlashing
 	md.lastErr = ""
 	md.mu.Unlock()
-	m.hub.Publish(topicEvents, sseMessage{Event: "devices"})
+	m.hub.Publish(sseMessage{Event: eventDevices})
 
-	flashTopic := topicConsole(id)
+	flashEv := flashEvent(id)
 	rec := FlashRecord{DeviceID: id, At: time.Now(), Firmware: fwName}
 
 	sum, size, err := fileSHA256(fwPath)
@@ -332,9 +332,9 @@ func (m *Manager) Flash(ctx context.Context, id, fwPath, fwName string) error {
 		if err == nil {
 			defer f.Close()
 			progress := func(done, total int64) {
-				m.hub.Publish(flashTopic, sseMessage{Event: "flash", Data: fmt.Sprintf("flashing: %d/%d bytes", done, total)})
+				m.hub.Publish(sseMessage{Event: flashEv, Data: fmt.Sprintf("flashing: %d/%d bytes", done, total)})
 			}
-			m.hub.Publish(flashTopic, sseMessage{Event: "flash", Data: "entering boot mode, flashing " + html.EscapeString(fwName) + " ..."})
+			m.hub.Publish(sseMessage{Event: flashEv, Data: "entering boot mode, flashing " + html.EscapeString(fwName) + " ..."})
 			start := time.Now()
 			err = dev.Flash(ctx, f, size, progress)
 			rec.DurationMs = time.Since(start).Milliseconds()
@@ -344,9 +344,9 @@ func (m *Manager) Flash(ctx context.Context, id, fwPath, fwName string) error {
 	rec.OK = err == nil
 	if err != nil {
 		rec.Err = err.Error()
-		m.hub.Publish(flashTopic, sseMessage{Event: "flash", Data: "flash FAILED: " + html.EscapeString(err.Error())})
+		m.hub.Publish(sseMessage{Event: flashEv, Data: "flash FAILED: " + html.EscapeString(err.Error())})
 	} else {
-		m.hub.Publish(flashTopic, sseMessage{Event: "flash", Data: "flash OK; board rebooting"})
+		m.hub.Publish(sseMessage{Event: flashEv, Data: "flash OK; board rebooting"})
 	}
 	_ = m.store.FlashRecord(rec)
 
@@ -356,7 +356,7 @@ func (m *Manager) Flash(ctx context.Context, id, fwPath, fwName string) error {
 		md.lastErr = err.Error()
 	}
 	md.mu.Unlock()
-	m.hub.Publish(topicEvents, sseMessage{Event: "devices"})
+	m.hub.Publish(sseMessage{Event: eventDevices})
 	return err
 }
 
@@ -380,7 +380,7 @@ func (m *Manager) EnterBootMode(ctx context.Context, id string) error {
 	md.mu.Lock()
 	md.state = StateAbsent
 	md.mu.Unlock()
-	m.hub.Publish(topicEvents, sseMessage{Event: "devices"})
+	m.hub.Publish(sseMessage{Event: eventDevices})
 	return dev.EnterBootMode(ctx)
 }
 
