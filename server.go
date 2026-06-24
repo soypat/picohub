@@ -2,14 +2,13 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
 
 	"github.com/a-h/templ"
-	"github.com/soypat/tinyboot/build/uf2"
+	"github.com/soypat/picohub/flash"
 )
 
 // Server wires the Manager, Store, and SSE Hub to HTTP routes.
@@ -163,7 +162,7 @@ func (s *Server) handleFlash(w http.ResponseWriter, r *http.Request) {
 	}
 	tmp.Close()
 
-	if err := validateUF2(tmpName); err != nil {
+	if err := flash.ValidateUF2(tmpName); err != nil {
 		os.Remove(tmpName)
 		http.Error(w, "invalid .uf2: "+err.Error(), http.StatusBadRequest)
 		return
@@ -211,22 +210,4 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	s.hub.Serve(w, r)
-}
-
-// validateUF2 confirms the uploaded file decodes as a UF2 image.
-func validateUF2(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	scratch := make([]byte, uf2.BlockSize)
-	blocks, _, err := uf2.DecodeAppendBlocks(nil, f, scratch)
-	if err != nil {
-		return err
-	}
-	if len(blocks) == 0 {
-		return fmt.Errorf("no UF2 blocks found")
-	}
-	return nil
 }

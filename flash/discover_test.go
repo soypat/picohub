@@ -1,4 +1,4 @@
-package main
+package flash
 
 import (
 	"os"
@@ -62,8 +62,8 @@ func TestDiscovererScan(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	d := &discoverer{sysClassTTY: filepath.Join(root, "sys", "class", "tty"), devDir: "/dev"}
-	got, err := d.scan()
+	d := &Discoverer{sysClassTTY: filepath.Join(root, "sys", "class", "tty"), devDir: "/dev"}
+	got, err := d.Scan()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,8 +121,8 @@ func TestScanBootsel(t *testing.T) {
 	writeUSBBusDev(t, bus, "2-1", "2e8a", "0005", "RUN123")        // CDC (running) -> not bootsel
 	writeUSBBusDev(t, bus, "usb1", "1d6b", "0002", "")             // root hub -> skipped
 
-	d := &discoverer{sysClassTTY: t.TempDir(), devDir: "/dev", sysBusUSB: bus}
-	got, err := d.scan()
+	d := &Discoverer{sysClassTTY: t.TempDir(), devDir: "/dev", sysBusUSB: bus}
+	got, err := d.Scan()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestScanBootsel(t *testing.T) {
 
 // A discoverer with sysBusUSB unset must not scan the host's real USB tree.
 func TestScanBootselDisabled(t *testing.T) {
-	d := &discoverer{sysClassTTY: t.TempDir(), devDir: "/dev"}
+	d := &Discoverer{sysClassTTY: t.TempDir(), devDir: "/dev"}
 	if got := d.scanBootsel(); got != nil {
 		t.Errorf("expected nil with sysBusUSB unset, got %+v", got)
 	}

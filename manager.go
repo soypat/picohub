@@ -13,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/soypat/picohub/flash"
 )
 
 // DevState is the lifecycle state of a managed board.
@@ -50,12 +52,12 @@ type managed struct {
 	ctrl sync.Mutex
 
 	mu      sync.Mutex
-	desc    Descriptor
+	desc    flash.Descriptor
 	state   DevState
 	sess    Session
 	lastErr string
 
-	dev      Device
+	dev      flash.Device
 	ring     *ringBuffer
 	byteLen  atomic.Int64
 	stop     chan struct{}
@@ -64,7 +66,7 @@ type managed struct {
 
 // DeviceView is the read-only snapshot the HTTP layer renders.
 type DeviceView struct {
-	Descriptor
+	flash.Descriptor
 	State    DevState
 	Session  Session
 	LastErr  string
@@ -76,7 +78,7 @@ type DeviceView struct {
 type Manager struct {
 	store    *Store
 	hub      *Hub
-	disco    *discoverer
+	disco    *flash.Discoverer
 	interval time.Duration
 	ringSize int
 
@@ -88,7 +90,7 @@ func NewManager(store *Store, hub *Hub, interval time.Duration, ringSize int) *M
 	return &Manager{
 		store:    store,
 		hub:      hub,
-		disco:    newDiscoverer(),
+		disco:    flash.NewDiscoverer(),
 		interval: interval,
 		ringSize: ringSize,
 		devices:  make(map[string]*managed),
@@ -125,12 +127,12 @@ func (m *Manager) get(id string, create bool) *managed {
 
 // reconcile scans the bus and starts/stops monitoring to match what is present.
 func (m *Manager) reconcile(ctx context.Context) {
-	found, err := m.disco.scan()
+	found, err := m.disco.Scan()
 	if err != nil {
 		slog.Debug("discovery scan failed", "err", err)
 		return
 	}
-	present := make(map[string]Descriptor, len(found))
+	present := make(map[string]flash.Descriptor, len(found))
 	for _, d := range found {
 		present[d.ID] = d
 	}
@@ -196,7 +198,7 @@ func (md *managed) snapshotState() DevState {
 }
 
 // startMonitoring opens the console, starts a session, and launches the pump.
-func (m *Manager) startMonitoring(ctx context.Context, md *managed, desc Descriptor) bool {
+func (m *Manager) startMonitoring(ctx context.Context, md *managed, desc flash.Descriptor) bool {
 	md.ctrl.Lock()
 	defer md.ctrl.Unlock()
 	if md.snapshotState() != StateAbsent {
@@ -205,7 +207,7 @@ func (m *Manager) startMonitoring(ctx context.Context, md *managed, desc Descrip
 
 	rec, _ := m.store.DeviceSeen(desc.ID, time.Now())
 	desc.Name = rec.Name
-	if rec.TargetOverride != TargetUnknown {
+	if rec.TargetOverride != flash.TargetUnknown {
 		desc.Target = rec.TargetOverride
 	}
 
@@ -217,7 +219,7 @@ func (m *Manager) startMonitoring(ctx context.Context, md *managed, desc Descrip
 
 	md.mu.Lock()
 	md.desc = desc
-	md.dev = newDevice(desc)
+	md.dev = flash.NewDevice(desc)
 	md.sess = sess
 	md.ring = newRingBuffer(m.ringSize)
 	md.byteLen.Store(0)
@@ -238,7 +240,7 @@ func (m *Manager) startMonitoring(ctx context.Context, md *managed, desc Descrip
 
 // registerBootsel records a board found in BOOTSEL mode as a present,
 // flashable device. There is no console to pump, so no session is started.
-func (m *Manager) registerBootsel(md *managed, desc Descriptor) bool {
+func (m *Manager) registerBootsel(md *managed, desc flash.Descriptor) bool {
 	md.ctrl.Lock()
 	defer md.ctrl.Unlock()
 	if md.snapshotState() != StateAbsent {
@@ -247,13 +249,13 @@ func (m *Manager) registerBootsel(md *managed, desc Descriptor) bool {
 
 	rec, _ := m.store.DeviceSeen(desc.ID, time.Now())
 	desc.Name = rec.Name
-	if rec.TargetOverride != TargetUnknown {
+	if rec.TargetOverride != flash.TargetUnknown {
 		desc.Target = rec.TargetOverride
 	}
 
 	md.mu.Lock()
 	md.desc = desc
-	md.dev = newDevice(desc)
+	md.dev = flash.NewDevice(desc)
 	md.state = StateBootsel
 	md.lastErr = ""
 	md.mu.Unlock()
@@ -313,7 +315,7 @@ func (m *Manager) teardownLocked(md *managed) {
 
 // pump reads the console, appends to the log + ring, and broadcasts to SSE. It
 // owns logf for the lifetime of the read loop and acquires no manager locks.
-func (m *Manager) pump(md *managed, dev Device, stop, done chan struct{}, ring *ringBuffer, logFile, consoleEv string) {
+func (m *Manager) pump(md *managed, dev flash.Device, stop, done chan struct{}, ring *ringBuffer, logFile, consoleEv string) {
 	defer close(done)
 	// Reopen the log file independently so the pump owns its handle.
 	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -507,14 +509,6 @@ func (m *Manager) shutdown() {
 			m.stopMonitoring(md)
 		}
 	}
-}
-
-// newDevice builds the concrete Device for a descriptor's target.
-func newDevice(desc Descriptor) Device {
-	if desc.Target.IsESP() {
-		return newESPDevice(desc)
-	}
-	return newRP2Device(desc)
 }
 
 // fileSHA256 returns the hex SHA-256 and size of a file.

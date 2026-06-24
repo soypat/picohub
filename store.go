@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/soypat/picohub/flash"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -25,7 +26,7 @@ var (
 type DeviceRecord struct {
 	ID             string    `json:"id"`
 	Name           string    `json:"name"`            // user label
-	TargetOverride Target    `json:"target_override"` // TargetUnknown = use discovered
+	TargetOverride flash.Target `json:"target_override"` // TargetUnknown = use discovered
 	FirstSeen      time.Time `json:"first_seen"`
 	LastSeen       time.Time `json:"last_seen"`
 	Notes          string    `json:"notes"`

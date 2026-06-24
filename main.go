@@ -19,7 +19,7 @@ import (
 
 func main() {
 	var (
-		addr     = flag.String("addr", ":8080", "HTTP listen address")
+		addr     = flag.String("addr", ":8081", "HTTP listen address")
 		dbPath   = flag.String("db", "picohub.db", "path to the bbolt database file")
 		logsDir  = flag.String("logs", "picohub-logs", "directory for per-session serial logs")
 		interval = flag.Duration("poll", time.Second, "USB discovery poll interval")

@@ -1,4 +1,4 @@
-package main
+package flash
 
 import (
 	"os"
@@ -36,26 +36,26 @@ func classifyTarget(vid, pid uint16) Target {
 	return TargetUnknown
 }
 
-// discoverer enumerates USB serial devices by reading sysfs. The sysfs root is
+// Discoverer enumerates USB serial devices by reading sysfs. The sysfs root is
 // configurable so the classification can be unit-tested against a fake tree.
-type discoverer struct {
+type Discoverer struct {
 	sysClassTTY string // default "/sys/class/tty"
 	devDir      string // default "/dev"
 	sysBusUSB   string // default "/sys/bus/usb/devices"; "" disables BOOTSEL scan
 }
 
-func newDiscoverer() *discoverer {
-	return &discoverer{
+func NewDiscoverer() *Discoverer {
+	return &Discoverer{
 		sysClassTTY: "/sys/class/tty",
 		devDir:      "/dev",
 		sysBusUSB:   "/sys/bus/usb/devices",
 	}
 }
 
-// scan returns a Descriptor for every USB-backed tty whose vid/pid maps to a
+// Scan returns a Descriptor for every USB-backed tty whose vid/pid maps to a
 // known board family. Descriptors carry the live Port and a stable ID; Name and
-// Target overrides are applied later by the Manager/Store.
-func (d *discoverer) scan() ([]Descriptor, error) {
+// Target overrides are applied later by the caller.
+func (d *Discoverer) Scan() ([]Descriptor, error) {
 	entries, err := os.ReadDir(d.sysClassTTY)
 	if err != nil {
 		return nil, err
@@ -100,7 +100,7 @@ func rp2BootselPID(vid, pid uint16) bool {
 // scanBootsel walks the USB device tree for boards currently in BOOTSEL mode
 // and returns a Descriptor (with no Port) for each. Returns nil if the scan is
 // disabled (sysBusUSB == "") or the tree is unreadable.
-func (d *discoverer) scanBootsel() []Descriptor {
+func (d *Discoverer) scanBootsel() []Descriptor {
 	if d.sysBusUSB == "" {
 		return nil
 	}
@@ -134,7 +134,7 @@ func (d *discoverer) scanBootsel() []Descriptor {
 
 // usbDeviceDir resolves /sys/class/tty/<name>/device and walks up to the USB
 // device directory (the one containing idVendor). Returns "" if not USB-backed.
-func (d *discoverer) usbDeviceDir(ttyName string) string {
+func (d *Discoverer) usbDeviceDir(ttyName string) string {
 	dir, err := filepath.EvalSymlinks(filepath.Join(d.sysClassTTY, ttyName, "device"))
 	if err != nil {
 		return ""

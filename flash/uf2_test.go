@@ -1,4 +1,4 @@
-package main
+package flash
 
 import (
 	"os"
@@ -28,7 +28,7 @@ func TestValidateUF2(t *testing.T) {
 	if err := os.WriteFile(good, out, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateUF2(good); err != nil {
+	if err := ValidateUF2(good); err != nil {
 		t.Errorf("valid uf2 rejected: %v", err)
 	}
 
@@ -37,7 +37,7 @@ func TestValidateUF2(t *testing.T) {
 	if err := os.WriteFile(bad, []byte("not a uf2 file at all, just text"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateUF2(bad); err == nil {
+	if err := ValidateUF2(bad); err == nil {
 		t.Error("expected non-uf2 file to be rejected")
 	}
 }

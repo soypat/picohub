@@ -1,4 +1,4 @@
-package main
+package flash
 
 import (
 	"context"
@@ -13,13 +13,6 @@ import (
 
 	"go.bug.st/serial"
 )
-
-// consoleBaud is the bitrate used for the USB-CDC console. USB-CDC ignores the
-// baud rate, but the library requires a valid mode.
-const consoleBaud = 115200
-
-// consoleReadTimeout bounds each console Read so the pump can poll for shutdown.
-const consoleReadTimeout = 300 * time.Millisecond
 
 // rp2BootselLabels are the FS labels the RP2 bootrom exposes in BOOTSEL mode.
 // RP2040 -> RPI-RP2, RP2350 -> RP2350; RPI2 is seen on some clones.

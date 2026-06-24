@@ -1,4 +1,4 @@
-package main
+package flash
 
 import (
 	"context"

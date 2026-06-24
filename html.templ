@@ -1,6 +1,10 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/soypat/picohub/flash"
+)
 
 // page is the master layout. The body connects to the global /events SSE stream
 // so that any element with hx-trigger="sse:devices" refreshes itself.
@@ -272,7 +276,7 @@ templ stateBadge(s DevState) {
 	}
 }
 
-templ targetBadge(t Target) {
+templ targetBadge(t flash.Target) {
 	<span class="badge target">{ t.String() }</span>
 }
 
