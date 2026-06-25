@@ -307,6 +307,39 @@ func (s *Store) DeleteSession(id string) (bool, error) {
 	return true, nil
 }
 
+// DeleteSessions removes every ended session for a device, along with their log
+// files. The live session (if any) is left untouched. Returns the count deleted.
+func (s *Store) DeleteSessions(deviceID string) (int, error) {
+	var victims []Session
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketSessions)
+		_ = b.ForEach(func(_, v []byte) error {
+			var sess Session
+			if json.Unmarshal(v, &sess) == nil && sess.DeviceID == deviceID && !sess.Active() {
+				victims = append(victims, sess)
+			}
+			return nil
+		})
+		for _, sess := range victims {
+			if err := b.Delete([]byte(sess.ID)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	for _, sess := range victims {
+		if sess.LogFile != "" {
+			if err := os.Remove(sess.LogFile); err != nil && !os.IsNotExist(err) {
+				return len(victims), err
+			}
+		}
+	}
+	return len(victims), nil
+}
+
 func (s *Store) Session(id string) (Session, bool, error) {
 	var sess Session
 	var found bool

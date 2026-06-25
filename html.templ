@@ -148,8 +148,22 @@ templ devicePage(d DeviceView, sessions []Session, flashes []FlashRecord) {
 	</div>
 
 	<section class="panel">
-		<h2>Logs</h2>
-		@sessionTable(d.ID, sessions)
+		<div class="section-header">
+			<h2>Logs</h2>
+			if len(sessions) > 0 {
+				<button
+					type="button"
+					class="linkish danger"
+					hx-delete={ "/devices/" + d.ID + "/logs" }
+					hx-confirm="Delete ALL log sessions for this device? This cannot be undone."
+					hx-target="#session-table"
+					hx-swap="innerHTML"
+				>Delete all</button>
+			}
+		</div>
+		<div id="session-table">
+			@sessionTable(d.ID, sessions)
+		</div>
 	</section>
 
 	<section class="panel">

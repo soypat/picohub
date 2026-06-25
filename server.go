@@ -37,6 +37,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /devices/{id}/logs/{sid}", s.handleLog)
 	mux.HandleFunc("GET /devices/{id}/logs/{sid}/raw", s.handleLogRaw)
 	mux.HandleFunc("DELETE /devices/{id}/logs/{sid}", s.handleLogDelete)
+	mux.HandleFunc("DELETE /devices/{id}/logs", s.handleLogsDeleteAll)
 	mux.HandleFunc("GET /events", s.handleEvents)
 	return mux
 }
@@ -149,6 +150,17 @@ func (s *Server) handleLogDelete(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("HX-Redirect", "/devices/"+id)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleLogsDeleteAll(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, err := s.store.DeleteSessions(id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Re-render the session table in place; a live session (if any) survives.
+	sessions, _ := s.store.Sessions(id)
+	s.renderPartial(w, r, sessionTable(id, sessions))
 }
 
 // --- action handlers -------------------------------------------------------
