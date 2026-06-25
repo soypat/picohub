@@ -24,30 +24,35 @@ var (
 // DeviceRecord is the persisted, user-editable metadata for a board. Live state
 // (Port, Present) is not stored here; it comes from discovery at runtime.
 type DeviceRecord struct {
-	ID             string    `json:"id"`
-	Name           string    `json:"name"`            // user label
+	ID             string       `json:"id"`
+	Name           string       `json:"name"`            // user label
 	TargetOverride flash.Target `json:"target_override"` // TargetUnknown = use discovered
-	FirstSeen      time.Time `json:"first_seen"`
-	LastSeen       time.Time `json:"last_seen"`
-	Notes          string    `json:"notes"`
+	FirstSeen      time.Time    `json:"first_seen"`
+	LastSeen       time.Time    `json:"last_seen"`
+	Notes          string       `json:"notes"`
 }
 
 // Session is one monitoring period for a device: from connect/flash until the
 // next flash or disconnect. The raw serial bytes are stored in LogFile on disk.
 type Session struct {
-	ID           string    `json:"id"`
-	DeviceID     string    `json:"device_id"`
-	Seq          int       `json:"seq"` // 1-based, per device
-	StartedAt    time.Time `json:"started_at"`
-	EndedAt      time.Time `json:"ended_at"` // zero while active
-	LogFile      string    `json:"log_file"`
-	ByteLen      int64     `json:"byte_len"`
-	FirmwareName string    `json:"firmware_name"` // firmware flashed at session start, if any
-	FirmwareSHA  string    `json:"firmware_sha"`
+	ID            string    `json:"id"`
+	DeviceID      string    `json:"device_id"`
+	Seq           int       `json:"seq"` // 1-based, per device
+	StartedAt     time.Time `json:"started_at"`
+	EndedAt       time.Time `json:"ended_at"` // zero while active
+	LogFile       string    `json:"log_file"`
+	ByteLen       int64     `json:"byte_len"`
+	FirmwareName  string    `json:"firmware_name"` // firmware flashed at session start, if any
+	FirmwareSHA   string    `json:"firmware_sha"`
+	ContinuedFrom string    `json:"continued_from"` // prior session ID when this is a rollover continuation
 }
 
 // Active reports whether the session is still being written to.
 func (s Session) Active() bool { return s.EndedAt.IsZero() }
+
+// Continuation reports whether this session continues an earlier one whose log
+// rolled over at the size limit.
+func (s Session) Continuation() bool { return s.ContinuedFrom != "" }
 
 // FlashRecord is one flash attempt (success or failure).
 type FlashRecord struct {
@@ -181,14 +186,29 @@ func (s *Store) SetDeviceName(id, name string) error {
 // SessionStart creates a new active session for a device and returns it, with
 // LogFile pointing at a fresh file path under logsDir (the caller opens it).
 func (s *Store) SessionStart(deviceID string, now time.Time) (Session, error) {
-	sess := Session{
-		ID:        newID(),
-		DeviceID:  deviceID,
-		StartedAt: now,
-	}
+	return s.startSession(Session{DeviceID: deviceID, StartedAt: now})
+}
+
+// SessionContinue starts a continuation session for a device whose previous log
+// rolled over at the size limit. It carries forward the firmware context and
+// links back to prev via ContinuedFrom.
+func (s *Store) SessionContinue(prev Session, now time.Time) (Session, error) {
+	return s.startSession(Session{
+		DeviceID:      prev.DeviceID,
+		StartedAt:     now,
+		ContinuedFrom: prev.ID,
+		FirmwareName:  prev.FirmwareName,
+		FirmwareSHA:   prev.FirmwareSHA,
+	})
+}
+
+// startSession assigns an ID, sequence, and log path to sess, persists it, and
+// ensures its log directory exists. The caller opens the log file.
+func (s *Store) startSession(sess Session) (Session, error) {
+	sess.ID = newID()
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		sess.Seq = s.nextSeq(tx, deviceID)
-		sess.LogFile = s.logPath(deviceID, sess.ID)
+		sess.Seq = s.nextSeq(tx, sess.DeviceID)
+		sess.LogFile = s.logPath(sess.DeviceID, sess.ID)
 		return txPut(tx, bucketSessions, sess.ID, sess)
 	})
 	if err != nil {
@@ -198,6 +218,43 @@ func (s *Store) SessionStart(deviceID string, now time.Time) (Session, error) {
 		return Session{}, err
 	}
 	return sess, nil
+}
+
+// EndStaleSessions marks any session still flagged active as ended. It is meant
+// to run once at startup: a session active at boot can only be a leftover from
+// a previous process that exited without ending it (a crash or kill). EndedAt
+// is set to the log file's last-modified time — the last moment output arrived
+// — and ByteLen is backfilled from the file size when it was never recorded.
+// Returns the number of sessions repaired.
+func (s *Store) EndStaleSessions() (int, error) {
+	n := 0
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketSessions)
+		var stale []Session
+		_ = b.ForEach(func(_, v []byte) error {
+			var sess Session
+			if json.Unmarshal(v, &sess) == nil && sess.Active() {
+				stale = append(stale, sess)
+			}
+			return nil
+		})
+		for _, sess := range stale {
+			ended := sess.StartedAt
+			if fi, err := os.Stat(sess.LogFile); err == nil {
+				ended = fi.ModTime()
+				if sess.ByteLen == 0 {
+					sess.ByteLen = fi.Size()
+				}
+			}
+			sess.EndedAt = ended
+			if err := txPut(tx, bucketSessions, sess.ID, sess); err != nil {
+				return err
+			}
+			n++
+		}
+		return nil
+	})
+	return n, err
 }
 
 // nextSeq returns the next per-device session sequence number.
@@ -224,6 +281,30 @@ func (s *Store) SessionUpdate(id string, fn func(*Session)) error {
 		fn(&sess)
 		return txPut(tx, bucketSessions, id, sess)
 	})
+}
+
+// DeleteSession removes a session's record and its on-disk log file. A missing
+// session is reported via the bool, not an error; a missing log file is ignored.
+func (s *Store) DeleteSession(id string) (bool, error) {
+	var sess Session
+	var found bool
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		var err error
+		found, err = txGet(tx, bucketSessions, id, &sess)
+		if err != nil || !found {
+			return err
+		}
+		return tx.Bucket(bucketSessions).Delete([]byte(id))
+	})
+	if err != nil || !found {
+		return found, err
+	}
+	if sess.LogFile != "" {
+		if err := os.Remove(sess.LogFile); err != nil && !os.IsNotExist(err) {
+			return true, err
+		}
+	}
+	return true, nil
 }
 
 func (s *Store) Session(id string) (Session, bool, error) {

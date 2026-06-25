@@ -41,6 +41,15 @@ func main() {
 	}
 	defer store.Close()
 
+	// Sessions still flagged active at startup are leftovers from a previous
+	// process that exited without ending them; mark them ended so they stop
+	// rendering as "live".
+	if n, err := store.EndStaleSessions(); err != nil {
+		slog.Warn("ending stale sessions", "err", err)
+	} else if n > 0 {
+		slog.Info("ended stale sessions from previous run", "count", n)
+	}
+
 	hub := NewHub()
 	mgr := NewManager(store, hub, *interval, *ringKB*1024)
 	srv := NewServer(store, mgr, hub)
@@ -48,7 +57,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	go mgr.Run(ctx)
+	mgrDone := make(chan struct{})
+	go func() {
+		mgr.Run(ctx)
+		close(mgrDone)
+	}()
 
 	httpSrv := &http.Server{Addr: *addr, Handler: srv.Handler()}
 	go func() {
@@ -63,4 +76,7 @@ func main() {
 		slog.Error("http server", "err", err)
 		os.Exit(1)
 	}
+	// Wait for the manager to finish ending sessions before the deferred
+	// store.Close runs, so Ctrl+C reliably marks live logs as ended.
+	<-mgrDone
 }

@@ -46,8 +46,10 @@ func (s DevState) String() string {
 //     never deadlock.
 //   - mu     guards the snapshot fields (state/desc/sess/lastErr) and is only
 //     ever held briefly, never across a blocking operation.
-//   - ring   is self-synchronized; logf is owned by the pump and closed only
-//     after the pump has exited; byteLen is atomic.
+//   - ring   is self-synchronized; the log file is owned by the pump and closed
+//     only after the pump has exited; byteLen is atomic. The pump acquires mu
+//     only briefly (via rollover) and never ctrl, so teardown — which waits on
+//     pumpDone while holding ctrl but not mu — can never deadlock against it.
 type managed struct {
 	ctrl sync.Mutex
 
@@ -313,8 +315,13 @@ func (m *Manager) teardownLocked(md *managed) {
 	}
 }
 
+// maxLogBytes is the size at which a session's log file rolls over into a
+// continuation session, capping any single file.
+const maxLogBytes = 5 << 20 // 5 MiB
+
 // pump reads the console, appends to the log + ring, and broadcasts to SSE. It
-// owns logf for the lifetime of the read loop and acquires no manager locks.
+// owns the log file for the lifetime of the read loop and acquires no manager
+// locks except briefly via rollover.
 func (m *Manager) pump(md *managed, dev flash.Device, stop, done chan struct{}, ring *ringBuffer, logFile, consoleEv string) {
 	defer close(done)
 	// Reopen the log file independently so the pump owns its handle.
@@ -323,7 +330,12 @@ func (m *Manager) pump(md *managed, dev flash.Device, stop, done chan struct{}, 
 		slog.Error("pump open log failed", "file", logFile, "err", err)
 		return
 	}
-	defer f.Close()
+	defer func() { f.Close() }()
+
+	var fileBytes int64
+	if fi, err := f.Stat(); err == nil {
+		fileBytes = fi.Size()
+	}
 
 	buf := make([]byte, 4096)
 	for {
@@ -338,13 +350,58 @@ func (m *Manager) pump(md *managed, dev flash.Device, stop, done chan struct{}, 
 			_, _ = f.Write(chunk)
 			ring.Write(chunk)
 			md.byteLen.Add(int64(n))
+			fileBytes += int64(n)
 			m.hub.Publish(sseMessage{Event: consoleEv, Data: html.EscapeString(string(chunk))})
+			if fileBytes >= maxLogBytes {
+				newFile, ok := m.rollover(md)
+				if ok {
+					nf, err := os.OpenFile(newFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+					if err != nil {
+						slog.Error("pump open rollover log failed", "file", newFile, "err", err)
+						return
+					}
+					_ = f.Close()
+					f, fileBytes = nf, 0
+				}
+			}
 		}
 		if rerr != nil {
 			slog.Debug("console read ended", "device", md.desc.ID, "err", rerr)
 			return
 		}
 	}
+}
+
+// rollover ends the device's current session and starts a continuation session
+// for the same device, returning the log file the pump should append to next.
+// Called by the pump when the active log file reaches maxLogBytes. The live
+// console ring is intentionally left untouched so the on-screen tail stays
+// continuous across the file boundary.
+func (m *Manager) rollover(md *managed) (string, bool) {
+	md.mu.Lock()
+	prev := md.sess
+	md.mu.Unlock()
+
+	total := md.byteLen.Load()
+	_ = m.store.SessionUpdate(prev.ID, func(s *Session) {
+		s.EndedAt = time.Now()
+		s.ByteLen = total
+	})
+
+	sess, err := m.store.SessionContinue(prev, time.Now())
+	if err != nil {
+		slog.Error("log rollover failed", "device", prev.DeviceID, "err", err)
+		return "", false
+	}
+
+	md.mu.Lock()
+	md.sess = sess
+	md.mu.Unlock()
+	md.byteLen.Store(0)
+
+	slog.Info("log rollover", "device", prev.DeviceID, "seq", sess.Seq, "continues", prev.Seq)
+	m.hub.Publish(sseMessage{Event: eventDevices})
+	return sess.LogFile, true
 }
 
 // Flash serializes a flash against the pump: stop monitoring, end the session,

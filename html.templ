@@ -205,7 +205,12 @@ templ sessionTable(deviceID string, sessions []Session) {
 			<tbody>
 				for _, s := range sessions {
 					<tr>
-						<td>{ fmt.Sprintf("%d", s.Seq) }</td>
+						<td>
+							{ fmt.Sprintf("%d", s.Seq) }
+							if s.Continuation() {
+								<span class="muted" title="continues the previous session after a log rollover">cont.</span>
+							}
+						</td>
 						<td class="mono">{ fmtTime(s.StartedAt) }</td>
 						<td class="mono">
 							if s.Active() {
@@ -218,6 +223,16 @@ templ sessionTable(deviceID string, sessions []Session) {
 						<td class="actions">
 							<a href={ templ.SafeURL("/devices/" + deviceID + "/logs/" + s.ID) }>view</a>
 							<a href={ templ.SafeURL("/devices/" + deviceID + "/logs/" + s.ID + "/raw") } download>download</a>
+							if !s.Active() {
+								<button
+									type="button"
+									class="linkish danger"
+									hx-delete={ "/devices/" + deviceID + "/logs/" + s.ID }
+									hx-confirm="Delete this log session? This cannot be undone."
+									hx-target="closest tr"
+									hx-swap="outerHTML"
+								>delete</button>
+							}
 						</td>
 					</tr>
 				}
@@ -261,6 +276,14 @@ templ logPage(d DeviceView, sess Session, content string) {
 	<div class="meta">
 		<span class="mono">started { fmtTime(sess.StartedAt) }</span>
 		<span class="mono">{ fmt.Sprintf("%d bytes", sess.ByteLen) }</span>
+		if !sess.Active() {
+			<button
+				type="button"
+				class="linkish danger"
+				hx-delete={ "/devices/" + d.ID + "/logs/" + sess.ID + "?redirect=1" }
+				hx-confirm="Delete this log session? This cannot be undone."
+			>delete session</button>
+		}
 	</div>
 	@textDisplay(content, logFileName(d.ID, sess))
 	@textDisplayScript()
@@ -384,6 +407,9 @@ templ pageStyle() {
 		button { padding: 8px 14px; background: #2563eb; color: #fff; border: 0; border-radius: 6px; cursor: pointer; font-weight: 600; }
 		button.secondary { background: #2b3142; }
 		button:hover { filter: brightness(1.1); }
+		button.linkish { background: none; border: 0; padding: 0; font: inherit; font-weight: 600; color: #6ea8fe; cursor: pointer; }
+		button.linkish:hover { filter: none; text-decoration: underline; }
+		button.linkish.danger { color: #f87171; }
 		.badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
 		.badge.ok, .ok { color: #34d399; }
 		.badge.warn, .warn { color: #fbbf24; }

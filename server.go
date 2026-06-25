@@ -36,6 +36,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /devices/{id}/rename", s.handleRename)
 	mux.HandleFunc("GET /devices/{id}/logs/{sid}", s.handleLog)
 	mux.HandleFunc("GET /devices/{id}/logs/{sid}/raw", s.handleLogRaw)
+	mux.HandleFunc("DELETE /devices/{id}/logs/{sid}", s.handleLogDelete)
 	mux.HandleFunc("GET /events", s.handleEvents)
 	return mux
 }
@@ -123,6 +124,31 @@ func (s *Server) handleLogRaw(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", logFileName(id, sess)))
 	http.ServeFile(w, r, sess.LogFile)
+}
+
+func (s *Server) handleLogDelete(w http.ResponseWriter, r *http.Request) {
+	id, sid := r.PathValue("id"), r.PathValue("sid")
+	sess, found, _ := s.store.Session(sid)
+	if !found || sess.DeviceID != id {
+		http.NotFound(w, r)
+		return
+	}
+	// The live session is owned by the pump, which holds its file handle open;
+	// refuse to delete it until monitoring ends.
+	if sess.Active() {
+		http.Error(w, "cannot delete a live session", http.StatusConflict)
+		return
+	}
+	if _, err := s.store.DeleteSession(sid); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// The log view page asks to be redirected back to the device once its
+	// session is gone; the session table just drops the row in place.
+	if r.URL.Query().Get("redirect") != "" {
+		w.Header().Set("HX-Redirect", "/devices/"+id)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- action handlers -------------------------------------------------------
