@@ -215,7 +215,10 @@ templ sessionTable(deviceID string, sessions []Session) {
 							}
 						</td>
 						<td class="mono">{ fmt.Sprintf("%d", s.ByteLen) }</td>
-						<td><a href={ templ.SafeURL("/devices/" + deviceID + "/logs/" + s.ID) }>view</a></td>
+						<td class="actions">
+							<a href={ templ.SafeURL("/devices/" + deviceID + "/logs/" + s.ID) }>view</a>
+							<a href={ templ.SafeURL("/devices/" + deviceID + "/logs/" + s.ID + "/raw") } download>download</a>
+						</td>
 					</tr>
 				}
 			</tbody>
@@ -258,9 +261,72 @@ templ logPage(d DeviceView, sess Session, content string) {
 	<div class="meta">
 		<span class="mono">started { fmtTime(sess.StartedAt) }</span>
 		<span class="mono">{ fmt.Sprintf("%d bytes", sess.ByteLen) }</span>
-		<a href={ templ.SafeURL("/devices/" + d.ID + "/logs/" + sess.ID + "/raw") }>download raw</a>
 	</div>
-	<pre class="console">{ content }</pre>
+	@textDisplay(content, logFileName(d.ID, sess))
+	@textDisplayScript()
+}
+
+// textDisplay renders a raw plaintext window with floating copy and download
+// buttons. The download button serializes the visible text client-side, so it
+// works for any content already rendered into the page.
+templ textDisplay(content string, name string) {
+	<div class="text-display">
+		if content != "" {
+			<div class="text-display-actions">
+				<button
+					type="button"
+					class="btn-icon"
+					onclick="copyTextDisplay(this)"
+					title="Copy to clipboard"
+				>📋</button>
+				<button
+					type="button"
+					class="btn-icon"
+					data-filename={ name }
+					onclick="downloadTextDisplay(this)"
+					title="Download as file"
+				>⬇️</button>
+			</div>
+		}
+		<pre class="console text-display-content">{ content }</pre>
+	</div>
+}
+
+// textDisplayScript powers the copy/download buttons rendered by textDisplay.
+templ textDisplayScript() {
+	<script>
+		function copyTextDisplay(button) {
+			var container = button.closest('.text-display');
+			if (!container) return;
+			var text = container.querySelector('.text-display-content').innerText;
+			navigator.clipboard.writeText(text).then(function () {
+				var original = button.innerText;
+				button.innerText = '✅';
+				setTimeout(function () { button.innerText = original; }, 1200);
+			}).catch(function () {
+				alert('Unable to copy text to clipboard.');
+			});
+		}
+
+		function downloadTextDisplay(button) {
+			var container = button.closest('.text-display');
+			if (!container) return;
+			var filename = button.getAttribute('data-filename');
+			if (filename == undefined || filename == "" || filename == null) {
+				filename = "picohub-log.txt";
+			}
+			var text = container.querySelector('.text-display-content').innerText;
+			var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+			var url = URL.createObjectURL(blob);
+			var a = document.createElement('a');
+			a.href = url;
+			a.download = filename;
+			document.body.appendChild(a);
+			a.click();
+			document.body.removeChild(a);
+			URL.revokeObjectURL(url);
+		}
+	</script>
 }
 
 templ stateBadge(s DevState) {
@@ -305,6 +371,11 @@ templ pageStyle() {
 		@media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
 		.panel { padding: 16px; background: #161922; border: 1px solid #232838; border-radius: 8px; margin-bottom: 16px; }
 		.console { background: #0a0c10; border: 1px solid #232838; border-radius: 6px; padding: 10px; height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-all; font-family: ui-monospace, monospace; font-size: 12px; color: #cfe3cf; margin: 0; }
+		.text-display { position: relative; margin-top: 8px; }
+		.text-display-actions { position: absolute; top: 8px; right: 8px; display: flex; gap: 4px; z-index: 1; }
+		.text-display .btn-icon { padding: 2px 6px; font-size: 14px; line-height: 1; font-weight: 400; background: #161922; border: 1px solid #232838; border-radius: 4px; color: #cfe3cf; opacity: 0.45; transition: opacity 0.15s; }
+		.text-display .btn-icon:hover { opacity: 1; background: #232838; filter: none; }
+		td.actions { display: flex; gap: 10px; }
 		.flash-log { font-family: ui-monospace, monospace; font-size: 12px; color: #e0b24c; margin-top: 6px; }
 		.row { display: flex; gap: 8px; margin-top: 10px; }
 		.col { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
