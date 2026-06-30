@@ -120,9 +120,15 @@ func (d *rp2Device) MountDir(ctx context.Context) (string, func() error, error) 
 		return mnt, func() error { return nil }, nil
 	}
 
+	// Each mount strategy that fails appends why it failed, so a hard failure
+	// reports the real cause (polkit denial, missing sudoers rule, ...) instead
+	// of a bare exit status.
+	var why []string
+
 	// Mount via udisksctl (root-free, mounts under /run/media/$USER).
 	if _, err := exec.LookPath("udisksctl"); err == nil {
-		if out, err := exec.CommandContext(ctx, "udisksctl", "mount", "-b", dev).CombinedOutput(); err == nil {
+		out, err := exec.CommandContext(ctx, "udisksctl", "mount", "-b", dev).CombinedOutput()
+		if err == nil {
 			mnt := findmnt(dev)
 			if mnt == "" {
 				mnt = parseUdisksMount(string(out))
@@ -133,7 +139,12 @@ func (d *rp2Device) MountDir(ctx context.Context) (string, func() error, error) 
 				}
 				return mnt, unmount, nil
 			}
+			why = append(why, "udisksctl reported success but no mountpoint found: "+oneLine(out))
+		} else {
+			why = append(why, fmt.Sprintf("udisksctl: %v: %s", err, oneLine(out)))
 		}
+	} else {
+		why = append(why, "udisksctl not found in PATH")
 	}
 
 	// Fallback: non-interactive sudo mount to a temp dir, owned by us.
@@ -142,9 +153,10 @@ func (d *rp2Device) MountDir(ctx context.Context) (string, func() error, error) 
 		return "", nil, err
 	}
 	uidgid := fmt.Sprintf("uid=%d,gid=%d", os.Getuid(), os.Getgid())
-	if err := exec.CommandContext(ctx, "sudo", "-n", "mount", "-o", uidgid, dev, mnt).Run(); err != nil {
+	if out, err := exec.CommandContext(ctx, "sudo", "-n", "mount", "-o", uidgid, dev, mnt).CombinedOutput(); err != nil {
 		_ = os.Remove(mnt)
-		return "", nil, fmt.Errorf("could not mount %s (tried udisksctl and 'sudo -n mount'): %w", dev, err)
+		why = append(why, fmt.Sprintf("sudo -n mount: %v: %s", err, oneLine(out)))
+		return "", nil, fmt.Errorf("could not mount %s:\n\t- %s", dev, strings.Join(why, "\n\t- "))
 	}
 	unmount := func() error {
 		err := exec.Command("sudo", "-n", "umount", mnt).Run()
@@ -227,6 +239,15 @@ func findmnt(dev string) string {
 		return ""
 	}
 	return strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
+}
+
+// oneLine collapses command output to a single trimmed line for error messages.
+func oneLine(b []byte) string {
+	s := strings.TrimSpace(string(b))
+	if s == "" {
+		return "(no output)"
+	}
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // parseUdisksMount extracts the mountpoint from "Mounted /dev/sdb1 at /path."

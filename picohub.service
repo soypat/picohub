@@ -1,0 +1,20 @@
+# lives in /etc/systemd/system/picohub.service
+[Unit]
+   Description=picohub
+   After=network.target
+
+[Service]
+   Type=simple
+   # Runs as root: flashing mounts BOOTSEL volumes and opens serial ports,
+   # both of which need privilege. Keep it simple until a real reason not to.
+   WorkingDirectory=/home/pato/picohub
+   # systemd sets no HOME for root services; `go` needs it to find GOPATH/module
+   # cache (and writes its build cache under it).
+   Environment=HOME=/root
+   # Add flags normally after command.
+   ExecStart=/usr/local/go/bin/go run /home/pato/picohub
+   Restart=always
+   RestartSec=5
+
+[Install]
+   WantedBy=multi-user.target
