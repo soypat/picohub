@@ -2,3 +2,4 @@
 *.db
 picohub
 local
+*_templ.go

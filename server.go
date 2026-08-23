@@ -34,6 +34,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /devices/{id}/bootmode", s.handleBootMode)
 	mux.HandleFunc("POST /devices/{id}/send", s.handleSend)
 	mux.HandleFunc("POST /devices/{id}/rename", s.handleRename)
+	mux.HandleFunc("POST /devices/{id}/ignore", s.handleIgnore)
 	mux.HandleFunc("GET /devices/{id}/logs/{sid}", s.handleLog)
 	mux.HandleFunc("GET /devices/{id}/logs/{sid}/raw", s.handleLogRaw)
 	mux.HandleFunc("DELETE /devices/{id}/logs/{sid}", s.handleLogDelete)
@@ -243,6 +244,22 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.hub.Publish(sseMessage{Event: eventDevices})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleIgnore marks a board as ignored — picohub releases the port and leaves
+// it alone for openocd and friends — or reclaims it. The manager publishes the
+// device event itself, and the page re-renders from that.
+func (s *Server) handleIgnore(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	ignored := r.FormValue("ignored") == "1"
+	if err := s.mgr.SetIgnored(id, ignored); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// The device page swaps its controls on this flag, so reload it rather than
+	// leaving stale buttons behind.
+	w.Header().Set("HX-Refresh", "true")
 	w.WriteHeader(http.StatusNoContent)
 }
 

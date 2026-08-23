@@ -50,6 +50,33 @@ func TestStoreDeviceRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStoreDeviceIgnored(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Now()
+
+	if _, err := st.DeviceSeen("dev-1", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetDeviceIgnored("dev-1", true); err != nil {
+		t.Fatal(err)
+	}
+	// Being seen again must not clear the flag: discovery reports presence, it
+	// does not get a say in policy.
+	rec, _ := st.DeviceSeen("dev-1", now.Add(time.Minute))
+	if !rec.Ignored {
+		t.Error("DeviceSeen cleared the ignore flag")
+	}
+
+	// A device may be marked ignored before discovery has ever reported it.
+	if err := st.SetDeviceIgnored("dev-2", true); err != nil {
+		t.Fatal(err)
+	}
+	got, found, _ := st.Device("dev-2")
+	if !found || !got.Ignored {
+		t.Errorf("ignore flag not persisted for an unseen device: %+v found=%v", got, found)
+	}
+}
+
 func TestStoreSessions(t *testing.T) {
 	st := newTestStore(t)
 

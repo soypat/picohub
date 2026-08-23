@@ -88,7 +88,7 @@ templ deviceCard(d DeviceView) {
 	<a class="card" href={ templ.SafeURL("/devices/" + d.ID) }>
 		<div class="card-head">
 			<span class="name">{ deviceName(d) }</span>
-			@stateBadge(d.State)
+			@stateBadge(d)
 		</div>
 		<div class="meta">
 			@targetBadge(d.Target)
@@ -117,19 +117,33 @@ templ devicePage(d DeviceView, sessions []Session, flashes []FlashRecord) {
 	<div class="grid">
 		<section class="panel">
 			<h2>Console</h2>
-			<pre id="console" class="console">{ d.RingText }</pre>
-			<div id="console-sink" sse-swap={ consoleEvent(d.ID) } hx-swap="beforeend" hx-target="#console"></div>
-			<div id="flash-log" class="flash-log" sse-swap={ flashEvent(d.ID) } hx-swap="beforeend"></div>
-			@consoleFollowScript()
-			<form class="row" hx-post={ "/devices/" + d.ID + "/send" } hx-swap="none">
-				<input type="text" name="line" placeholder="send a line to the board..." autocomplete="off"/>
-				<button type="submit">Send</button>
-			</form>
+			if d.Ignored {
+				<p class="muted">
+					Console is off: picohub is not opening
+					if d.Port != "" {
+						<span class="mono">{ d.Port }</span>
+					} else {
+						this board
+					}
+					, so openocd, gdb or a terminal program can own it.
+				</p>
+			} else {
+				<pre id="console" class="console">{ d.RingText }</pre>
+				<div id="console-sink" sse-swap={ consoleEvent(d.ID) } hx-swap="beforeend" hx-target="#console"></div>
+				<div id="flash-log" class="flash-log" sse-swap={ flashEvent(d.ID) } hx-swap="beforeend"></div>
+				@consoleFollowScript()
+				<form class="row" hx-post={ "/devices/" + d.ID + "/send" } hx-swap="none">
+					<input type="text" name="line" placeholder="send a line to the board..." autocomplete="off"/>
+					<button type="submit">Send</button>
+				</form>
+			}
 		</section>
 
 		<section class="panel">
 			<h2>Flash</h2>
-			if d.Target.IsESP() {
+			if d.Ignored {
+				<p class="muted">Flashing is disabled while this board is ignored.</p>
+			} else if d.Target.IsESP() {
 				<p class="muted">ESP flashing is not yet supported (Phase 2). Console monitoring works.</p>
 			} else {
 				<form hx-post={ "/devices/" + d.ID + "/flash" } hx-encoding="multipart/form-data" hx-swap="none" class="col">
@@ -137,9 +151,12 @@ templ devicePage(d DeviceView, sessions []Session, flashes []FlashRecord) {
 					<button type="submit">Flash firmware (.uf2)</button>
 				</form>
 			}
-			<form hx-post={ "/devices/" + d.ID + "/bootmode" } hx-swap="none" class="col">
-				<button type="submit" class="secondary">Enter boot mode</button>
-			</form>
+			if !d.Ignored {
+				<form hx-post={ "/devices/" + d.ID + "/bootmode" } hx-swap="none" class="col">
+					<button type="submit" class="secondary">Enter boot mode</button>
+				</form>
+			}
+			@ignoreForm(d)
 			<form hx-post={ "/devices/" + d.ID + "/rename" } hx-swap="none" class="row">
 				<input type="text" name="name" placeholder="rename device..." value={ d.Name }/>
 				<button type="submit" class="secondary">Rename</button>
@@ -172,6 +189,25 @@ templ devicePage(d DeviceView, sessions []Session, flashes []FlashRecord) {
 	</section>
 }
 
+// ignoreForm toggles whether picohub attaches to a board at all. Ignoring
+// releases the port immediately; reclaiming re-attaches on the next discovery
+// poll. Either way the page reloads, since half the controls swap.
+templ ignoreForm(d DeviceView) {
+	<form hx-post={ "/devices/" + d.ID + "/ignore" } hx-swap="none" class="col">
+		if d.Ignored {
+			<input type="hidden" name="ignored" value="0"/>
+			<button type="submit" class="secondary">Resume picohub control</button>
+		} else {
+			<input type="hidden" name="ignored" value="1"/>
+			<button
+				type="submit"
+				class="secondary"
+				hx-confirm="Release this board? picohub will close its console, end the live log session and stop auto-connecting until you resume."
+			>Release board (ignore)</button>
+		}
+	</form>
+}
+
 // consoleFollowScript keeps the console scrolled to the newest output as it
 // streams in (tail-follow). Following pauses automatically when the user
 // scrolls up to read history and resumes once they return to the bottom.
@@ -196,7 +232,7 @@ templ consoleFollowScript() {
 
 templ deviceStatus(d DeviceView) {
 	<div class="status">
-		@stateBadge(d.State)
+		@stateBadge(d)
 		@targetBadge(d.Target)
 		<span class="mono">{ d.VIDPID() }</span>
 		if d.Present {
@@ -366,16 +402,28 @@ templ textDisplayScript() {
 	</script>
 }
 
-templ stateBadge(s DevState) {
-	switch s {
-		case StateMonitoring:
-			<span class="badge ok">monitoring</span>
-		case StateFlashing:
-			<span class="badge warn">flashing</span>
-		case StateBootsel:
-			<span class="badge warn">BOOTSEL</span>
-		default:
-			<span class="badge muted">absent</span>
+// stateBadge renders a board's facts as separate badges rather than collapsing
+// them into one label: policy (ignored) and activity (busy) are independent of
+// what the bus says, so an ignored board still reports whether it is plugged in.
+templ stateBadge(d DeviceView) {
+	if d.Ignored {
+		<span class="badge ignored" title="picohub is not touching this board">ignored</span>
+	}
+	if d.Busy != "" {
+		<span class="badge warn">{ d.Busy }</span>
+	} else {
+		switch d.Presence {
+			case OnBootsel:
+				<span class="badge warn">BOOTSEL</span>
+			case OnConsole:
+				if d.Attached {
+					<span class="badge ok">monitoring</span>
+				} else {
+					<span class="badge muted">idle</span>
+				}
+			default:
+				<span class="badge muted">absent</span>
+		}
 	}
 }
 
@@ -428,6 +476,7 @@ templ pageStyle() {
 		.badge.ok, .ok { color: #34d399; }
 		.badge.warn, .warn { color: #fbbf24; }
 		.badge.muted { color: #7a8290; }
+		.badge.ignored { background: #2b2338; color: #c084fc; }
 		.badge.target { background: #232838; color: #9bb0d4; }
 		.err { color: #f87171; font-size: 12px; }
 		.live { color: #34d399; font-weight: 600; }

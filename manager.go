@@ -17,35 +17,52 @@ import (
 	"github.com/soypat/picohub/flash"
 )
 
-// DevState is the lifecycle state of a managed board.
-type DevState int
+// A board's runtime state is four independent facts, not one enum. Keeping them
+// apart is what lets policy ("leave this board alone") be expressed without
+// touching the lifecycle code:
+//
+//   - presence — what the USB bus says. Reported by discovery, never decided here.
+//   - attached — whether we hold the port and are pumping its console.
+//   - ignored  — policy from the store: the user wants picohub to keep its hands off.
+//   - busy     — an exclusive operation (flash, boot mode) owns the board.
+//
+// Only `attached` is ours to choose, and reconcile chooses it in exactly one
+// place: wantAttached.
+
+// Presence is what the USB bus says about a board.
+type Presence int
 
 const (
-	StateAbsent     DevState = iota // not enumerated on the bus
-	StateMonitoring                 // present, console pump running
-	StateFlashing                   // a flash is in progress (board may be off-bus)
-	StateBootsel                    // present in BOOTSEL mass-storage mode, ready to flash (no console)
+	Gone      Presence = iota // not enumerated on the bus
+	OnConsole                 // enumerated as a USB-CDC tty
+	OnBootsel                 // enumerated as RP2 BOOTSEL mass storage (no console)
 )
 
-func (s DevState) String() string {
-	switch s {
-	case StateMonitoring:
-		return "monitoring"
-	case StateFlashing:
-		return "flashing"
-	case StateBootsel:
+func (p Presence) String() string {
+	switch p {
+	case OnConsole:
+		return "console"
+	case OnBootsel:
 		return "bootsel"
 	default:
 		return "absent"
 	}
 }
 
+// Names of the exclusive operations that can own a board, shown as-is in the UI.
+const (
+	busyFlashing = "flashing"
+	busyBootMode = "entering boot mode"
+)
+
 // managed is the Manager's per-board runtime state. Locking discipline:
-//   - ctrl   serializes lifecycle transitions and is held across blocking waits
-//     on pumpDone. The pump must never acquire ctrl or mu, so stopping it can
-//     never deadlock.
-//   - mu     guards the snapshot fields (state/desc/sess/lastErr) and is only
-//     ever held briefly, never across a blocking operation.
+//   - ctrl   serializes attaching, detaching and exclusive operations, and is
+//     held across blocking waits on pumpDone and for the whole of a flash. The
+//     pump must never acquire ctrl or mu, so stopping it can never deadlock.
+//     Discovery only ever TryLocks it, so a board someone else owns is skipped
+//     rather than waited on.
+//   - mu     guards the snapshot fields and is only ever held briefly, never
+//     across a blocking operation.
 //   - ring   is self-synchronized; the log file is owned by the pump and closed
 //     only after the pump has exited; byteLen is atomic. The pump acquires mu
 //     only briefly (via rollover) and never ctrl, so teardown — which waits on
@@ -53,11 +70,14 @@ func (s DevState) String() string {
 type managed struct {
 	ctrl sync.Mutex
 
-	mu      sync.Mutex
-	desc    flash.Descriptor
-	state   DevState
-	sess    Session
-	lastErr string
+	mu       sync.Mutex
+	desc     flash.Descriptor
+	presence Presence
+	attached bool   // console pump running and the port is ours
+	ignored  bool   // mirrors DeviceRecord.Ignored
+	busy     string // exclusive operation owning the board, "" when idle
+	sess     Session
+	lastErr  string
 
 	dev      flash.Device
 	ring     *ringBuffer
@@ -66,23 +86,29 @@ type managed struct {
 	pumpDone chan struct{}
 }
 
-// DeviceView is the read-only snapshot the HTTP layer renders.
+// DeviceView is the read-only snapshot the HTTP layer renders. It exposes the
+// four facts separately rather than a single collapsed status, so the UI can
+// say "ignored and unplugged" without either fact hiding the other.
 type DeviceView struct {
 	flash.Descriptor
-	State    DevState
+	Presence Presence
+	Attached bool
+	Ignored  bool
+	Busy     string
 	Session  Session
 	LastErr  string
 	RingText string
 }
 
-// Manager discovers boards, runs a console pump per board, and serializes
-// flashing against the pump.
+// Manager discovers boards, runs a console pump per attached board, and
+// serializes exclusive operations against the pump.
 type Manager struct {
 	store    *Store
 	hub      *Hub
 	disco    *flash.Discoverer
 	interval time.Duration
 	ringSize int
+	poked    chan struct{} // wakes reconcile early after a policy change
 
 	mu      sync.Mutex
 	devices map[string]*managed
@@ -95,6 +121,7 @@ func NewManager(store *Store, hub *Hub, interval time.Duration, ringSize int) *M
 		disco:    flash.NewDiscoverer(),
 		interval: interval,
 		ringSize: ringSize,
+		poked:    make(chan struct{}, 1),
 		devices:  make(map[string]*managed),
 	}
 }
@@ -103,15 +130,26 @@ func NewManager(store *Store, hub *Hub, interval time.Duration, ringSize int) *M
 func (m *Manager) Run(ctx context.Context) {
 	t := time.NewTicker(m.interval)
 	defer t.Stop()
-	m.reconcile(ctx)
+	m.reconcile()
 	for {
 		select {
 		case <-ctx.Done():
 			m.shutdown()
 			return
 		case <-t.C:
-			m.reconcile(ctx)
+			m.reconcile()
+		case <-m.poked:
+			m.reconcile()
 		}
+	}
+}
+
+// poke asks for a reconcile pass now instead of at the next tick. It never
+// blocks: a pass is already pending if the buffer is full.
+func (m *Manager) poke() {
+	select {
+	case m.poked <- struct{}{}:
+	default:
 	}
 }
 
@@ -121,69 +159,59 @@ func (m *Manager) get(id string, create bool) *managed {
 	defer m.mu.Unlock()
 	md := m.devices[id]
 	if md == nil && create {
-		md = &managed{state: StateAbsent}
+		// Seed the identity: a board can be created here before discovery has
+		// ever described it (released while unplugged), and the UI links by ID.
+		md = &managed{desc: flash.Descriptor{ID: id}}
 		m.devices[id] = md
 	}
 	return md
 }
 
-// reconcile scans the bus and starts/stops monitoring to match what is present.
-func (m *Manager) reconcile(ctx context.Context) {
+// wantAttached reports whether picohub should be holding a board's console: it
+// has to be on the bus as a CDC device, and not held back by policy. This is
+// the only place the attach decision is made.
+func wantAttached(desc flash.Descriptor, ignored bool) bool {
+	return desc.Present && !desc.BootSel && !ignored
+}
+
+// applyRecord overlays a device's persisted, user-editable metadata onto a
+// freshly discovered descriptor.
+func applyRecord(desc flash.Descriptor, rec DeviceRecord) flash.Descriptor {
+	desc.Name = rec.Name
+	if rec.TargetOverride != flash.TargetUnknown {
+		desc.Target = rec.TargetOverride
+	}
+	return desc
+}
+
+// reconcile makes the world match the bus and the stored policy: for every
+// board it computes whether we want to be attached and converges to that. It
+// does not branch on how the board got into its current state.
+func (m *Manager) reconcile() {
 	found, err := m.disco.Scan()
 	if err != nil {
 		slog.Debug("discovery scan failed", "err", err)
 		return
 	}
-	present := make(map[string]flash.Descriptor, len(found))
+	onBus := make(map[string]flash.Descriptor, len(found))
 	for _, d := range found {
-		present[d.ID] = d
+		onBus[d.ID] = d
 	}
 
 	changed := false
-	for id, desc := range present {
+	for _, id := range m.ids(onBus) {
 		md := m.get(id, true)
-		switch md.snapshotState() {
-		case StateFlashing:
-			// Board legitimately drops off and returns during a flash; the
-			// flash routine restores monitoring afterwards.
-			continue
-		case StateAbsent:
-			ok := false
-			if desc.BootSel {
-				ok = m.registerBootsel(md, desc)
-			} else {
-				ok = m.startMonitoring(ctx, md, desc)
-			}
-			if ok {
-				changed = true
-			}
-		default: // monitoring/bootsel: refresh the live port
-			md.mu.Lock()
-			md.desc.Port = desc.Port
-			md.desc.LastSeen = time.Now()
-			md.mu.Unlock()
+		desc, present := onBus[id]
+		ignored := md.isIgnored()
+		if present {
+			// While a board is on the bus the store is the authority on policy.
+			rec := m.storedRecord(id)
+			desc, ignored = applyRecord(desc, rec), rec.Ignored
 		}
-	}
-
-	// Devices that vanished: stop the pump / clear bootsel and mark absent.
-	m.mu.Lock()
-	all := make([]*managed, 0, len(m.devices))
-	ids := make([]string, 0, len(m.devices))
-	for id, md := range m.devices {
-		all = append(all, md)
-		ids = append(ids, id)
-	}
-	m.mu.Unlock()
-	for i, md := range all {
-		if _, ok := present[ids[i]]; ok {
-			continue
-		}
-		switch md.snapshotState() {
-		case StateMonitoring:
-			m.stopMonitoring(md)
+		if md.observe(desc, present, ignored) {
 			changed = true
-		case StateBootsel:
-			m.clearBootsel(md)
+		}
+		if m.converge(md, desc, wantAttached(desc, ignored)) {
 			changed = true
 		}
 	}
@@ -193,26 +221,85 @@ func (m *Manager) reconcile(ctx context.Context) {
 	}
 }
 
-func (md *managed) snapshotState() DevState {
-	md.mu.Lock()
-	defer md.mu.Unlock()
-	return md.state
+// ids returns every board worth a pass: the ones discovery just reported plus
+// the ones we already track, so a board that vanished is noticed.
+func (m *Manager) ids(onBus map[string]flash.Descriptor) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ids := make([]string, 0, len(m.devices)+len(onBus))
+	for id := range m.devices {
+		ids = append(ids, id)
+	}
+	for id := range onBus {
+		if _, known := m.devices[id]; !known {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
-// startMonitoring opens the console, starts a session, and launches the pump.
-func (m *Manager) startMonitoring(ctx context.Context, md *managed, desc flash.Descriptor) bool {
-	md.ctrl.Lock()
-	defer md.ctrl.Unlock()
-	if md.snapshotState() != StateAbsent {
+// storedRecord reads a board's persisted metadata, creating the record only the
+// first time that board is ever seen. Reconcile runs every poll interval and a
+// bolt write is an fsync, so the common path must stay a read; LastSeen is
+// stamped on the transitions that matter instead (see attachLocked).
+func (m *Manager) storedRecord(id string) DeviceRecord {
+	rec, found, err := m.store.Device(id)
+	if err == nil && found {
+		return rec
+	}
+	rec, err = m.store.DeviceSeen(id, time.Now())
+	if err != nil {
+		slog.Debug("device record unavailable", "device", id, "err", err)
+	}
+	return rec
+}
+
+// observe records what discovery and the store say about a board. It opens and
+// closes nothing — that is converge's job — and reports whether the board's
+// presence changed, which is what the device list renders.
+func (md *managed) observe(desc flash.Descriptor, present, ignored bool) bool {
+	md.mu.Lock()
+	defer md.mu.Unlock()
+	was := md.presence
+	md.ignored = ignored
+	if !present {
+		md.presence = Gone
+		md.desc.Port = "" // the tty is gone; the board's identity is not
+		return md.presence != was
+	}
+	desc.LastSeen = time.Now()
+	md.desc = desc
+	md.presence = OnConsole
+	if desc.BootSel {
+		md.presence = OnBootsel
+	}
+	return md.presence != was
+}
+
+// converge attaches or detaches a board to match want. It never waits for
+// another operation to finish: a board someone else owns is left for the next
+// pass, so discovery cannot be stalled by a slow flash.
+func (m *Manager) converge(md *managed, desc flash.Descriptor, want bool) bool {
+	if !md.ctrl.TryLock() {
 		return false
 	}
-
-	rec, _ := m.store.DeviceSeen(desc.ID, time.Now())
-	desc.Name = rec.Name
-	if rec.TargetOverride != flash.TargetUnknown {
-		desc.Target = rec.TargetOverride
+	defer md.ctrl.Unlock()
+	switch {
+	case want && !md.isAttached():
+		return m.attachLocked(md, desc)
+	case !want && md.isAttached():
+		m.detachLocked(md)
+		return true
 	}
+	return false
+}
 
+// attachLocked opens the console, starts a session, and launches the pump.
+// md.ctrl must be held.
+func (m *Manager) attachLocked(md *managed, desc flash.Descriptor) bool {
+	if _, err := m.store.DeviceSeen(desc.ID, time.Now()); err != nil {
+		slog.Debug("stamping LastSeen failed", "device", desc.ID, "err", err)
+	}
 	sess, err := m.store.SessionStart(desc.ID, time.Now())
 	if err != nil {
 		slog.Error("session start failed", "device", desc.ID, "err", err)
@@ -225,80 +312,37 @@ func (m *Manager) startMonitoring(ctx context.Context, md *managed, desc flash.D
 	md.sess = sess
 	md.ring = newRingBuffer(m.ringSize)
 	md.byteLen.Store(0)
-	md.state = StateMonitoring
+	md.attached = true
 	md.lastErr = ""
 	md.stop = make(chan struct{})
 	md.pumpDone = make(chan struct{})
-	dev := md.dev
-	stop := md.stop
-	done := md.pumpDone
-	ring := md.ring
+	dev, stop, done, ring := md.dev, md.stop, md.pumpDone, md.ring
 	md.mu.Unlock()
 
 	go m.pump(md, dev, stop, done, ring, sess.LogFile, consoleEvent(desc.ID))
-	slog.Info("monitoring", "device", desc.ID, "port", desc.Port, "target", desc.Target)
+	slog.Info("attached", "device", desc.ID, "port", desc.Port, "target", desc.Target)
 	return true
 }
 
-// registerBootsel records a board found in BOOTSEL mode as a present,
-// flashable device. There is no console to pump, so no session is started.
-func (m *Manager) registerBootsel(md *managed, desc flash.Descriptor) bool {
+// detach releases a board: it stops the pump, closes the port and ends the live
+// session. It is the only implementation of "let go of this board" — reconcile,
+// Flash, EnterBootMode, SetIgnored and shutdown all route through it.
+func (m *Manager) detach(md *managed) {
 	md.ctrl.Lock()
 	defer md.ctrl.Unlock()
-	if md.snapshotState() != StateAbsent {
-		return false
-	}
-
-	rec, _ := m.store.DeviceSeen(desc.ID, time.Now())
-	desc.Name = rec.Name
-	if rec.TargetOverride != flash.TargetUnknown {
-		desc.Target = rec.TargetOverride
-	}
-
-	md.mu.Lock()
-	md.desc = desc
-	md.dev = flash.NewDevice(desc)
-	md.state = StateBootsel
-	md.lastErr = ""
-	md.mu.Unlock()
-	slog.Info("bootsel", "device", desc.ID, "target", desc.Target)
-	return true
+	m.detachLocked(md)
 }
 
-// clearBootsel marks a vanished BOOTSEL device absent (it rebooted into its
-// firmware, or was unplugged).
-func (m *Manager) clearBootsel(md *managed) {
-	md.ctrl.Lock()
-	defer md.ctrl.Unlock()
+// detachLocked is detach with md.ctrl already held; md.mu must NOT be.
+func (m *Manager) detachLocked(md *managed) {
 	md.mu.Lock()
-	if md.state == StateBootsel {
-		md.state = StateAbsent
-		md.dev = nil
-	}
-	md.mu.Unlock()
-	slog.Info("bootsel gone", "device", md.desc.ID)
-}
-
-// stopMonitoring stops the pump and ends the session (ctrl held across the wait).
-func (m *Manager) stopMonitoring(md *managed) {
-	md.ctrl.Lock()
-	defer md.ctrl.Unlock()
-	m.teardownLocked(md)
-	md.mu.Lock()
-	md.state = StateAbsent
-	md.mu.Unlock()
-	slog.Info("device gone", "device", md.desc.ID)
-}
-
-// teardownLocked stops the pump (if running), closes the device and log file,
-// and records the session end. md.ctrl must be held; md.mu must NOT be.
-func (m *Manager) teardownLocked(md *managed) {
-	md.mu.Lock()
-	st := md.state
+	attached := md.attached
 	stop, done, dev, sessID := md.stop, md.pumpDone, md.dev, md.sess.ID
+	md.attached = false
+	md.dev = nil
 	md.mu.Unlock()
 
-	if st != StateMonitoring {
+	if !attached {
 		return
 	}
 	close(stop)
@@ -313,6 +357,73 @@ func (m *Manager) teardownLocked(md *managed) {
 			s.ByteLen = byteLen
 		})
 	}
+	slog.Info("detached", "device", md.descID())
+}
+
+// claim takes a board for an exclusive operation, naming the activity for the
+// UI. It returns the board's descriptor with md.ctrl held: the caller must call
+// release when done. Discovery only TryLocks ctrl, so it leaves the board alone
+// until then.
+func (m *Manager) claim(id, activity string) (*managed, flash.Descriptor, error) {
+	md := m.get(id, false)
+	if md == nil {
+		return nil, flash.Descriptor{}, fmt.Errorf("unknown device %q", id)
+	}
+	if !md.ctrl.TryLock() {
+		return nil, flash.Descriptor{}, fmt.Errorf("device %q is busy", id)
+	}
+
+	md.mu.Lock()
+	desc, presence, ignored := md.desc, md.presence, md.ignored
+	md.mu.Unlock()
+
+	var err error
+	switch {
+	case ignored:
+		err = fmt.Errorf("device %q is ignored; resume picohub control first", id)
+	case presence == Gone:
+		err = fmt.Errorf("device %q is not present", id)
+	}
+	if err != nil {
+		md.ctrl.Unlock()
+		return nil, flash.Descriptor{}, err
+	}
+
+	md.mu.Lock()
+	md.busy = activity
+	md.lastErr = ""
+	md.mu.Unlock()
+	m.hub.Publish(sseMessage{Event: eventDevices})
+	return md, desc, nil
+}
+
+// release ends an exclusive operation and asks reconcile to re-attach the board
+// if policy says it should be attached.
+func (m *Manager) release(md *managed) {
+	md.mu.Lock()
+	md.busy = ""
+	md.mu.Unlock()
+	md.ctrl.Unlock()
+	m.hub.Publish(sseMessage{Event: eventDevices})
+	m.poke()
+}
+
+func (md *managed) isAttached() bool {
+	md.mu.Lock()
+	defer md.mu.Unlock()
+	return md.attached
+}
+
+func (md *managed) isIgnored() bool {
+	md.mu.Lock()
+	defer md.mu.Unlock()
+	return md.ignored
+}
+
+func (md *managed) descID() string {
+	md.mu.Lock()
+	defer md.mu.Unlock()
+	return md.desc.ID
 }
 
 // maxLogBytes is the size at which a session's log file rolls over into a
@@ -366,7 +477,7 @@ func (m *Manager) pump(md *managed, dev flash.Device, stop, done chan struct{}, 
 			}
 		}
 		if rerr != nil {
-			slog.Debug("console read ended", "device", md.desc.ID, "err", rerr)
+			slog.Debug("console read ended", "device", md.descID(), "err", rerr)
 			return
 		}
 	}
@@ -404,33 +515,27 @@ func (m *Manager) rollover(md *managed) (string, bool) {
 	return sess.LogFile, true
 }
 
-// Flash serializes a flash against the pump: stop monitoring, end the session,
-// run dev.Flash, record the result, then mark the device absent so the next
-// reconcile re-establishes monitoring on the rebooted board.
+// flashLog publishes one flash-status line wrapped in a block element, so the
+// #flash-log container (which appends with beforeend) shows each on its own row
+// rather than running them together inline.
+func (m *Manager) flashLog(ev, text string) {
+	m.hub.Publish(sseMessage{Event: ev, Data: "<div>" + text + "</div>"})
+}
+
+// Flash claims the board, drops the console so the port is free, writes the
+// firmware, and records the result. Releasing the claim lets the next reconcile
+// pass re-attach the rebooted board.
 func (m *Manager) Flash(ctx context.Context, id, fwPath, fwName string) error {
-	md := m.get(id, false)
-	if md == nil {
-		return fmt.Errorf("unknown device %q", id)
+	md, desc, err := m.claim(id, busyFlashing)
+	if err != nil {
+		return err
 	}
-	md.ctrl.Lock()
-	defer md.ctrl.Unlock()
+	defer m.release(md)
+	m.detachLocked(md)
 
-	md.mu.Lock()
-	state, dev := md.state, md.dev
-	md.mu.Unlock()
-	if state == StateFlashing {
-		return fmt.Errorf("device %q is already flashing", id)
-	}
-	if dev == nil {
-		return fmt.Errorf("device %q is not present", id)
-	}
-
-	m.teardownLocked(md)
-	md.mu.Lock()
-	md.state = StateFlashing
-	md.lastErr = ""
-	md.mu.Unlock()
-	m.hub.Publish(sseMessage{Event: eventDevices})
+	// A fresh Device: the one the pump was using has been closed with it.
+	dev := flash.NewDevice(desc)
+	defer dev.Close()
 
 	flashEv := flashEvent(id)
 	rec := FlashRecord{DeviceID: id, At: time.Now(), Firmware: fwName}
@@ -443,9 +548,9 @@ func (m *Manager) Flash(ctx context.Context, id, fwPath, fwName string) error {
 		if err == nil {
 			defer f.Close()
 			progress := func(done, total int64) {
-				m.hub.Publish(sseMessage{Event: flashEv, Data: fmt.Sprintf("flashing: %d/%d bytes", done, total)})
+				m.flashLog(flashEv, fmt.Sprintf("flashing: %d/%d bytes", done, total))
 			}
-			m.hub.Publish(sseMessage{Event: flashEv, Data: "entering boot mode, flashing " + html.EscapeString(fwName) + " ..."})
+			m.flashLog(flashEv, "entering boot mode, flashing "+html.EscapeString(fwName)+" ...")
 			start := time.Now()
 			err = dev.Flash(ctx, f, size, progress)
 			rec.DurationMs = time.Since(start).Milliseconds()
@@ -455,44 +560,53 @@ func (m *Manager) Flash(ctx context.Context, id, fwPath, fwName string) error {
 	rec.OK = err == nil
 	if err != nil {
 		rec.Err = err.Error()
-		m.hub.Publish(sseMessage{Event: flashEv, Data: "flash FAILED: " + html.EscapeString(err.Error())})
+		m.flashLog(flashEv, "flash FAILED: "+html.EscapeString(err.Error()))
 	} else {
-		m.hub.Publish(sseMessage{Event: flashEv, Data: "flash OK; board rebooting"})
+		m.flashLog(flashEv, "flash OK; board rebooting")
 	}
 	_ = m.store.FlashRecord(rec)
 
-	md.mu.Lock()
-	md.state = StateAbsent
 	if err != nil {
+		md.mu.Lock()
 		md.lastErr = err.Error()
+		md.mu.Unlock()
 	}
-	md.mu.Unlock()
-	m.hub.Publish(sseMessage{Event: eventDevices})
 	return err
 }
 
 // EnterBootMode resets a present board into its programming mode without
 // flashing (leaves an RP2 board in BOOTSEL with its volume available).
 func (m *Manager) EnterBootMode(ctx context.Context, id string) error {
-	md := m.get(id, false)
-	if md == nil {
-		return fmt.Errorf("unknown device %q", id)
+	md, desc, err := m.claim(id, busyBootMode)
+	if err != nil {
+		return err
 	}
-	md.ctrl.Lock()
-	defer md.ctrl.Unlock()
+	defer m.release(md)
+	m.detachLocked(md)
 
-	md.mu.Lock()
-	dev := md.dev
-	md.mu.Unlock()
-	if dev == nil {
-		return fmt.Errorf("device %q is not present", id)
-	}
-	m.teardownLocked(md)
-	md.mu.Lock()
-	md.state = StateAbsent
-	md.mu.Unlock()
-	m.hub.Publish(sseMessage{Event: eventDevices})
+	dev := flash.NewDevice(desc)
+	defer dev.Close()
 	return dev.EnterBootMode(ctx)
+}
+
+// SetIgnored marks a board as ignored (or reclaims it). Ignoring detaches
+// immediately, so the port is free for an external tool by the time this
+// returns; reclaiming leaves the re-attach to the reconcile pass it pokes.
+func (m *Manager) SetIgnored(id string, ignored bool) error {
+	if err := m.store.SetDeviceIgnored(id, ignored); err != nil {
+		return err
+	}
+	md := m.get(id, true) // a board may be released while unplugged
+	md.mu.Lock()
+	md.ignored = ignored
+	md.mu.Unlock()
+	if ignored {
+		m.detach(md)
+	}
+	slog.Info("ignore flag changed", "device", id, "ignored", ignored)
+	m.hub.Publish(sseMessage{Event: eventDevices})
+	m.poke()
+	return nil
 }
 
 // Send writes a line (a trailing newline is added) to a board's console.
@@ -502,11 +616,10 @@ func (m *Manager) Send(id, line string) error {
 		return fmt.Errorf("unknown device %q", id)
 	}
 	md.mu.Lock()
-	dev := md.dev
-	ok := md.state == StateMonitoring
+	dev, attached := md.dev, md.attached
 	md.mu.Unlock()
-	if !ok || dev == nil {
-		return fmt.Errorf("device %q is not monitoring", id)
+	if !attached || dev == nil {
+		return fmt.Errorf("device %q is not attached", id)
 	}
 	_, err := dev.Write([]byte(line + "\n"))
 	return err
@@ -542,12 +655,15 @@ func (md *managed) view() DeviceView {
 	defer md.mu.Unlock()
 	v := DeviceView{
 		Descriptor: md.desc,
-		State:      md.state,
+		Presence:   md.presence,
+		Attached:   md.attached,
+		Ignored:    md.ignored,
+		Busy:       md.busy,
 		Session:    md.sess,
 		LastErr:    md.lastErr,
 	}
 	v.Session.ByteLen = md.byteLen.Load()
-	v.Present = md.state != StateAbsent
+	v.Present = md.presence != Gone
 	if md.ring != nil {
 		v.RingText = md.ring.String()
 	}
@@ -562,9 +678,7 @@ func (m *Manager) shutdown() {
 	}
 	m.mu.Unlock()
 	for _, md := range mds {
-		if md.snapshotState() == StateMonitoring {
-			m.stopMonitoring(md)
-		}
+		m.detach(md)
 	}
 }
 

@@ -30,6 +30,11 @@ type DeviceRecord struct {
 	FirstSeen      time.Time    `json:"first_seen"`
 	LastSeen       time.Time    `json:"last_seen"`
 	Notes          string       `json:"notes"`
+	// Ignored leaves the board alone: no console is opened, no session is
+	// started and no flashing is offered, so an external tool (openocd, gdb,
+	// minicom) can own the port. The board is still listed and still tracked
+	// as present/absent by discovery.
+	Ignored bool `json:"ignored"`
 }
 
 // Session is one monitoring period for a device: from connect/flash until the
@@ -167,6 +172,18 @@ func (s *Store) Devices() ([]DeviceRecord, error) {
 
 // SetDeviceName updates the user label for a device.
 func (s *Store) SetDeviceName(id, name string) error {
+	return s.updateDevice(id, func(rec *DeviceRecord) { rec.Name = name })
+}
+
+// SetDeviceIgnored marks a device as ignored (or reclaims it), see
+// DeviceRecord.Ignored.
+func (s *Store) SetDeviceIgnored(id string, ignored bool) error {
+	return s.updateDevice(id, func(rec *DeviceRecord) { rec.Ignored = ignored })
+}
+
+// updateDevice applies fn to a device's record, creating it if the device has
+// never been seen (a record may be edited before discovery ever reports it).
+func (s *Store) updateDevice(id string, fn func(*DeviceRecord)) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		var rec DeviceRecord
 		found, err := txGet(tx, bucketDevices, id, &rec)
@@ -176,7 +193,7 @@ func (s *Store) SetDeviceName(id, name string) error {
 		if !found {
 			rec = DeviceRecord{ID: id, FirstSeen: time.Now()}
 		}
-		rec.Name = name
+		fn(&rec)
 		return txPut(tx, bucketDevices, id, rec)
 	})
 }

@@ -32,6 +32,20 @@ Mounting a Pico's BOOTSEL volume uses `udisksctl` (when a desktop session is
 present) with a `mount` fallback. Both need privilege, so on a headless box run
 picohub as **root** (see below).
 
+## Sharing a board with openocd (ignore)
+
+A board can be marked **ignored** from its device page ("Release board"). picohub
+then never opens its console, starts no log session and offers no flashing — it
+only keeps listing the board and tracking present/absent — so `openocd`, `gdb` or
+a terminal program can own the port. Releasing takes effect immediately: the
+pump stops and the live session ends before the request returns. "Resume picohub
+control" re-attaches on the next discovery poll.
+
+The flag is per device and persisted, so it survives replug and restarts. Mark a
+debug probe ignored once and picohub will leave it alone from then on — a probe
+enumerates as an ordinary RP2 board, so picohub cannot tell on its own that the
+port belongs to openocd.
+
 ## Run as a systemd service
 
 Flashing mounts the BOOTSEL mass-storage volume and opens serial ports — both
