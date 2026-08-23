@@ -46,6 +46,77 @@ debug probe ignored once and picohub will leave it alone from then on — a prob
 enumerates as an ordinary RP2 board, so picohub cannot tell on its own that the
 port belongs to openocd.
 
+## Remote debugging (openocd)
+
+Each device has a **debug page** (`/devices/<id>/debug`, linked from the device
+page) that turns the machine picohub runs on into a debug server: picohub
+supervises an `openocd` process for the probe and serves the GDB remote protocol
+on a TCP port. You run gdb on your own machine.
+
+The ELF never leaves your machine. gdb reads DWARF from a local copy and `load`
+writes flash through the remote protocol, so picohub does no ELF handling at all
+— it only needs `openocd` installed on the host.
+
+```sh
+# on your machine, once a session is running
+tinygo build -o out.elf -target=pico2 ./yourpkg
+gdb-multiarch out.elf \
+  -ex "target extended-remote picohub-host:3333" \
+  -ex "monitor halt" -ex "load" -ex "monitor reset halt"
+```
+
+The debug page shows the probe's identity, the openocd config in use (interface
+and target `.cfg` names plus adapter speed, persisted per device and defaulted
+from the discovered chip), live openocd output, and the exact gdb command with
+the right host and port filled in.
+
+A session claims the board for as long as it runs: picohub closes the console
+and will not re-attach until you stop the session. Discovery keeps tracking the
+board as present or absent throughout.
+
+> **The gdb port is unauthenticated.** Anyone who can reach it can halt the chip,
+> read and write all of its memory, and reprogram the board. It defaults to
+> listening on every interface (`-ocd-bind 0.0.0.0`). Pass
+> `-ocd-bind 127.0.0.1` to keep sessions on the host and reach them through an
+> SSH tunnel (`ssh -L 3333:localhost:3333 picohub-host`) instead. openocd's
+> telnet and Tcl consoles, which expose far more than the gdb port does, are
+> always disabled.
+
+Flags: `-ocd-bind` (listen address, default `0.0.0.0`), `-ocd-port` (first port
+a session takes, default `3333`; concurrent sessions take the next free ones),
+`-openocd` (path to the binary), `-ocd-scripts` (openocd's config search path).
+
+**Finding openocd.** picohub looks the binary up on *its own* `PATH`, which for a
+systemd service is a minimal one — not your login shell's. An openocd built
+outside the system prefixes will not be found even though typing `openocd`
+works for you. Point picohub at it:
+
+```
+ExecStart=/usr/local/go/bin/go run /home/pato/picohub -openocd /home/pato/local/openocd/openocd
+```
+
+A relocated build that keeps its configs beside the binary (a `scripts/` or
+`tcl/` directory next to it) is detected automatically; anything else needs
+`-ocd-scripts`. The debug page shows which binary and search path were resolved.
+
+**Permissions.** openocd talks to the probe's raw USB interface, which needs
+either root or a udev rule. picohub already runs as root under systemd; run as
+an ordinary user it fails with `unable to find a matching CMSIS-DAP device`
+even though the probe is plugged in.
+
+**The target is not the probe.** The `target/<name>.cfg` setting names the chip
+*wired to* the probe over SWD, which picohub has no way to discover — it only
+sees the probe's own USB id. The default is derived from that id, so it is only
+correct when the board being debugged is the board picohub is listing. Set it
+per device on the debug page.
+
+**Board family.** Discovery infers the family from VID/PID, which cannot always
+separate two chips: an RP2350-based Debug Probe enumerates as `2e8a:000c`
+exactly like the RP2040-based one, so both are classified `pico`. The debug page
+has a **Board family** selector that pins it (persisted per device, `auto`
+clears the pin). Pinning it also changes the openocd target the debug config
+defaults to.
+
 ## Run as a systemd service
 
 Flashing mounts the BOOTSEL mass-storage volume and opens serial ports — both
@@ -73,6 +144,11 @@ polkit rule or an `/etc/fstab` entry, which isn't worth the complexity here.
   the [cmd/picoflash](cmd/picoflash/) CLI or tests.
 - **Store** ([store.go](store.go)) keeps device/session/flash metadata in bbolt;
   raw serial bytes live as append-only per-session files under `-logs`.
+- **OCD** (the [ocd](ocd/) package) supervises an `openocd` process per probe:
+  it builds and *validates* the command line (config names reach it from a web
+  form, so they are rejected rather than escaped), waits for openocd's own
+  "Listening on port N for gdb connections" before reporting success, and owns
+  the process until it is stopped. Like `flash`, it is server-independent.
 - **Web** ([server.go](server.go), [html.templ](html.templ)) is `net/http` +
   [Templ](https://templ.guide) + HTMX + SSE: a dashboard, a per-device page
   (live console, flash/boot-mode/rename, history), and a log browser.

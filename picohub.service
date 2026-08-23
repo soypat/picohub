@@ -12,7 +12,11 @@
    # cache (and writes its build cache under it).
    Environment=HOME=/root
    # Add flags normally after command.
-   ExecStart=/usr/local/go/bin/go run /home/pato/picohub
+   #
+   # -openocd: systemd gives this service a minimal PATH, not a login shell's,
+   # so an openocd built outside the system prefixes must be named explicitly.
+   # Its configs are picked up from the scripts/ directory beside the binary.
+   ExecStart=/usr/local/go/bin/go run /home/pato/picohub -openocd /home/pato/local/openocd/openocd
    Restart=always
    RestartSec=5
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 
 	"github.com/soypat/picohub/flash"
 )
@@ -107,7 +108,10 @@ templ deviceCard(d DeviceView) {
 templ devicePage(d DeviceView, sessions []Session, flashes []FlashRecord) {
 	<div class="section-header">
 		<h1>{ deviceName(d) }</h1>
-		<a href="/" class="muted">&larr; all devices</a>
+		<div class="row">
+			<a href={ templ.URL("/devices/" + d.ID + "/debug") } class="muted">debug&hellip;</a>
+			<a href="/" class="muted">&larr; all devices</a>
+		</div>
 	</div>
 
 	<div id="device-status" hx-get={ "/partials/devices/" + d.ID + "/status" } hx-trigger="sse:devices" hx-swap="innerHTML">
@@ -476,6 +480,11 @@ templ pageStyle() {
 		.badge.ok, .ok { color: #34d399; }
 		.badge.warn, .warn { color: #fbbf24; }
 		.badge.muted { color: #7a8290; }
+		.kv { border-collapse: collapse; margin-top: 10px; }
+		.kv td { padding: 3px 14px 3px 0; vertical-align: top; }
+		.kv td:first-child { color: #7a8290; white-space: nowrap; }
+		label.col > span { font-size: 12px; }
+		input:disabled { opacity: 0.55; }
 		.badge.ignored { background: #2b2338; color: #c084fc; }
 		.badge.target { background: #232838; color: #9bb0d4; }
 		.err { color: #f87171; font-size: 12px; }
@@ -484,4 +493,192 @@ templ pageStyle() {
 		th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #232838; }
 		th { color: #7a8290; font-weight: 600; }
 	</style>
+}
+
+// debugPage is the per-device view of on-chip debugging: what the probe is, how
+// OpenOCD is configured for it, and the command to run on another machine once
+// a session is up.
+templ debugPage(v DebugPageView) {
+	<div class="section-header">
+		<h1>Debug { deviceName(v.Device) }</h1>
+		<a href={ templ.URL("/devices/" + v.Device.ID) } class="muted">&larr; back to device</a>
+	</div>
+
+	<section class="panel">
+		<h2>Probe</h2>
+		<div class="status">
+			@stateBadge(v.Device)
+			@targetBadge(v.Device.Target)
+		</div>
+		<table class="kv">
+			<tbody>
+				<tr><td>ID</td><td class="mono">{ v.Device.ID }</td></tr>
+				<tr><td>USB</td><td class="mono">{ v.Device.VIDPID() }</td></tr>
+				<tr>
+					<td>Serial</td>
+					<td class="mono">
+						if s := probeSerial(v.Device.ID); s != "" {
+							{ s }
+						} else {
+							<span class="muted">not reported; OpenOCD will take the first matching probe</span>
+						}
+					</td>
+				</tr>
+				<tr>
+					<td>Console port</td>
+					<td class="mono">
+						if v.Device.Port != "" {
+							{ v.Device.Port }
+						} else {
+							<span class="muted">&mdash;</span>
+						}
+					</td>
+				</tr>
+			</tbody>
+		</table>
+		<p class="muted">
+			picohub cannot tell a debug probe from an ordinary board &mdash; both
+			enumerate the same way. Anything listed here can be served to OpenOCD;
+			whether that works depends on what is actually wired to it.
+		</p>
+
+		<form hx-post={ "/devices/" + v.Device.ID + "/target" } hx-swap="none" class="col">
+			<label class="col">
+				<span class="muted">
+					Board family. Discovery infers this from the USB id, which cannot
+					always tell one chip from another &mdash; an RP2350-based Debug Probe
+					enumerates as <span class="mono">2e8a:000c</span> exactly like the
+					RP2040-based one. Pin it here when the guess is wrong.
+				</span>
+				<select name="target">
+					<option value="" selected?={ v.TargetOverride == flash.TargetUnknown }>
+						auto &mdash; whatever discovery says
+					</option>
+					for _, t := range flash.Targets() {
+						<option value={ t.String() } selected?={ v.TargetOverride == t }>{ t.String() }</option>
+					}
+				</select>
+			</label>
+			<div class="row">
+				<button type="submit" class="secondary">Set family</button>
+			</div>
+		</form>
+	</section>
+
+	<section class="panel">
+		<h2>OpenOCD</h2>
+		if v.OpenOCDErr != "" {
+			<p class="err">{ v.OpenOCDErr }</p>
+			<p class="muted">
+				This is picohub's own environment, not your shell's. A service started
+				by systemd gets a minimal PATH, so an OpenOCD built outside the system
+				prefixes will not be found even though it works when you type it.
+				Point picohub at it with
+				<span class="mono">-openocd /path/to/openocd</span>; if that build keeps
+				its configs next to the binary they are picked up automatically,
+				otherwise add <span class="mono">-ocd-scripts /path/to/scripts</span>.
+			</p>
+		} else {
+			<table class="kv">
+				<tbody>
+					<tr><td>Version</td><td class="mono">{ v.OpenOCDVersion }</td></tr>
+					<tr><td>Binary</td><td class="mono">{ v.OpenOCDPath }</td></tr>
+					<tr>
+						<td>Config search path</td>
+						<td class="mono">
+							if v.OpenOCDScripts != "" {
+								{ v.OpenOCDScripts }
+							} else {
+								<span class="muted">OpenOCD's own default</span>
+							}
+						</td>
+					</tr>
+				</tbody>
+			</table>
+		}
+		if v.ConfigErr != "" {
+			<p class="err">{ v.ConfigErr }</p>
+		}
+		<form hx-post={ "/devices/" + v.Device.ID + "/debug/config" } hx-swap="none" class="col">
+			<label class="col">
+				<span class="muted">Interface config &mdash; <span class="mono">interface/&lt;name&gt;.cfg</span></span>
+				<input name="interface" value={ v.Config.Interface } placeholder="cmsis-dap" disabled?={ v.Running }/>
+			</label>
+			<label class="col">
+				<span class="muted">
+					Target config &mdash; <span class="mono">target/&lt;name&gt;.cfg</span>.
+					This is the chip <em>wired to</em> the probe, which picohub cannot
+					see. The default is guessed from the probe's own USB id and is
+					only right when the probe is the board.
+				</span>
+				<input name="target" value={ v.Config.Target } placeholder="rp2040" disabled?={ v.Running }/>
+			</label>
+			<label class="col">
+				<span class="muted">Adapter speed in kHz &mdash; 0 leaves OpenOCD's default</span>
+				<input name="speed_khz" value={ strconv.Itoa(v.Config.SpeedKHz) } disabled?={ v.Running }/>
+			</label>
+			<div class="row">
+				<button type="submit" class="secondary" disabled?={ v.Running }>Save config</button>
+			</div>
+		</form>
+		if v.Running {
+			<p class="muted">Stop the session to change its configuration.</p>
+		}
+	</section>
+
+	<section class="panel">
+		<h2>Session</h2>
+		if v.Running {
+			<p>
+				<span class="live">running</span>
+				&mdash; serving the GDB remote protocol on <span class="mono">{ v.Device.DebugAddr }</span>
+			</p>
+			<p class="muted">
+				picohub is holding this board for the session: its console is closed and
+				it will not be re-attached until the session ends.
+			</p>
+			<form hx-post={ "/devices/" + v.Device.ID + "/debug/stop" } hx-swap="none" class="row">
+				<button type="submit" class="secondary">Stop session</button>
+			</form>
+
+			<h3>Debug it from another machine</h3>
+			<p class="muted">
+				Build with debug information &mdash; <span class="mono">tinygo build</span> keeps DWARF
+				unless you pass <span class="mono">-no-debug</span> &mdash; then point gdb at this host.
+				The ELF stays on your machine; only the remote protocol crosses the network.
+			</p>
+			@textDisplay(v.GDBCommand(), "gdb-"+v.Device.ID+".sh")
+		} else {
+			if v.OpenOCDErr == "" {
+				if v.Exposed() {
+					<p class="warn">
+						Starting a session opens an unauthenticated port on
+						<span class="mono">{ v.Bind }</span>. Anyone who can reach this host on
+						that port can halt the chip, read and write all of its memory, and
+						reprogram it. Restart picohub with
+						<span class="mono">-ocd-bind 127.0.0.1</span> to keep sessions on this
+						machine and reach them over an SSH tunnel instead.
+					</p>
+				} else {
+					<p class="muted">
+						Sessions listen on <span class="mono">{ v.Bind }</span> only. Forward the
+						port to reach one from another machine, for example
+						<span class="mono">ssh -L 3333:localhost:3333 { v.GDBHost }</span>.
+					</p>
+				}
+				<form hx-post={ "/devices/" + v.Device.ID + "/debug/start" } hx-swap="none" class="row">
+					<button type="submit">Start debug session</button>
+				</form>
+			}
+			if v.Device.LastErr != "" {
+				<p class="err">{ v.Device.LastErr }</p>
+			}
+		}
+	</section>
+
+	<section class="panel">
+		<h2>OpenOCD output</h2>
+		<pre id="debug-log" class="console flash-log">{ v.Device.DebugLog }</pre>
+		<div id="debug-sink" sse-swap={ debugEvent(v.Device.ID) } hx-swap="beforeend" hx-target="#debug-log"></div>
+	</section>
 }

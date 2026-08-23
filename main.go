@@ -25,6 +25,10 @@ func main() {
 		interval = flag.Duration("poll", time.Second, "USB discovery poll interval")
 		ringKB   = flag.Int("ring", 64, "in-memory console tail size per device, in KiB")
 		debug    = flag.Bool("debug", false, "enable debug logging")
+		ocdBind  = flag.String("ocd-bind", "0.0.0.0", "address OpenOCD's gdb port listens on; 127.0.0.1 keeps debug sessions off the network")
+		ocdPort  = flag.Int("ocd-port", 3333, "first TCP port a debug session listens on")
+		ocdBin   = flag.String("openocd", "", "openocd executable; a name on PATH or a path (default \"openocd\")")
+		ocdCfgs  = flag.String("ocd-scripts", "", "OpenOCD config search path; default is derived from the binary's location")
 	)
 	flag.Parse()
 
@@ -51,7 +55,7 @@ func main() {
 	}
 
 	hub := NewHub()
-	mgr := NewManager(store, hub, *interval, *ringKB*1024)
+	mgr := NewManager(store, hub, *interval, *ringKB*1024, DebugOptions{BindTo: *ocdBind, PortBase: *ocdPort, Binary: *ocdBin, ScriptsDir: *ocdCfgs})
 	srv := NewServer(store, mgr, hub)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

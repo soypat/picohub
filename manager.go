@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/soypat/picohub/flash"
+	"github.com/soypat/picohub/ocd"
 )
 
 // A board's runtime state is four independent facts, not one enum. Keeping them
@@ -53,6 +54,7 @@ func (p Presence) String() string {
 const (
 	busyFlashing = "flashing"
 	busyBootMode = "entering boot mode"
+	busyDebug    = "debugging"
 )
 
 // managed is the Manager's per-board runtime state. Locking discipline:
@@ -80,6 +82,8 @@ type managed struct {
 	lastErr  string
 
 	dev      flash.Device
+	ocdSrv   *ocd.Server // OpenOCD session owning the probe, nil when none
+	ocdRing  *ringBuffer // OpenOCD output tail
 	ring     *ringBuffer
 	byteLen  atomic.Int64
 	stop     chan struct{}
@@ -98,6 +102,12 @@ type DeviceView struct {
 	Session  Session
 	LastErr  string
 	RingText string
+
+	// DebugAddr is the address a remote gdb connects to while a debug session
+	// is running, and is empty when none is. DebugLog is that session's
+	// OpenOCD output tail.
+	DebugAddr string
+	DebugLog  string
 }
 
 // Manager discovers boards, runs a console pump per attached board, and
@@ -108,19 +118,38 @@ type Manager struct {
 	disco    *flash.Discoverer
 	interval time.Duration
 	ringSize int
+	debugOpt DebugOptions
 	poked    chan struct{} // wakes reconcile early after a policy change
 
 	mu      sync.Mutex
 	devices map[string]*managed
 }
 
-func NewManager(store *Store, hub *Hub, interval time.Duration, ringSize int) *Manager {
+// DebugOptions says how debug sessions are exposed on the network.
+type DebugOptions struct {
+	// BindTo is the address OpenOCD's gdb port listens on. Empty means every
+	// interface, which makes the port reachable from the network.
+	BindTo string
+	// PortBase is the first TCP port a session tries; each concurrent session
+	// takes the next free one.
+	PortBase int
+	// Binary is the openocd executable: a name to look up on PATH, or a path.
+	// Empty means "openocd". A service started by systemd does not inherit a
+	// login shell's PATH, so a build outside the system prefixes needs this.
+	Binary string
+	// ScriptsDir is OpenOCD's config search path. Empty derives one from the
+	// binary's location, see ocd.ScriptsFor.
+	ScriptsDir string
+}
+
+func NewManager(store *Store, hub *Hub, interval time.Duration, ringSize int, debugOpt DebugOptions) *Manager {
 	return &Manager{
 		store:    store,
 		hub:      hub,
 		disco:    flash.NewDiscoverer(),
 		interval: interval,
 		ringSize: ringSize,
+		debugOpt: debugOpt,
 		poked:    make(chan struct{}, 1),
 		devices:  make(map[string]*managed),
 	}
@@ -364,7 +393,12 @@ func (m *Manager) detachLocked(md *managed) {
 // UI. It returns the board's descriptor with md.ctrl held: the caller must call
 // release when done. Discovery only TryLocks ctrl, so it leaves the board alone
 // until then.
-func (m *Manager) claim(id, activity string) (*managed, flash.Descriptor, error) {
+//
+// allowIgnored admits operations that do not need the serial port. An ignored
+// board is one picohub must not open a console on by itself; an explicitly
+// requested debug session claims the probe's SWD interface instead, which is a
+// different resource, so the policy does not apply to it.
+func (m *Manager) claim(id, activity string, allowIgnored bool) (*managed, flash.Descriptor, error) {
 	md := m.get(id, false)
 	if md == nil {
 		return nil, flash.Descriptor{}, fmt.Errorf("unknown device %q", id)
@@ -379,7 +413,7 @@ func (m *Manager) claim(id, activity string) (*managed, flash.Descriptor, error)
 
 	var err error
 	switch {
-	case ignored:
+	case ignored && !allowIgnored:
 		err = fmt.Errorf("device %q is ignored; resume picohub control first", id)
 	case presence == Gone:
 		err = fmt.Errorf("device %q is not present", id)
@@ -526,7 +560,7 @@ func (m *Manager) flashLog(ev, text string) {
 // firmware, and records the result. Releasing the claim lets the next reconcile
 // pass re-attach the rebooted board.
 func (m *Manager) Flash(ctx context.Context, id, fwPath, fwName string) error {
-	md, desc, err := m.claim(id, busyFlashing)
+	md, desc, err := m.claim(id, busyFlashing, false)
 	if err != nil {
 		return err
 	}
@@ -577,7 +611,7 @@ func (m *Manager) Flash(ctx context.Context, id, fwPath, fwName string) error {
 // EnterBootMode resets a present board into its programming mode without
 // flashing (leaves an RP2 board in BOOTSEL with its volume available).
 func (m *Manager) EnterBootMode(ctx context.Context, id string) error {
-	md, desc, err := m.claim(id, busyBootMode)
+	md, desc, err := m.claim(id, busyBootMode, false)
 	if err != nil {
 		return err
 	}
@@ -604,6 +638,31 @@ func (m *Manager) SetIgnored(id string, ignored bool) error {
 		m.detach(md)
 	}
 	slog.Info("ignore flag changed", "device", id, "ignored", ignored)
+	m.hub.Publish(sseMessage{Event: eventDevices})
+	m.poke()
+	return nil
+}
+
+// SetTargetOverride pins a board's family, for the boards discovery cannot
+// classify from VID/PID alone. An RP2350-based debug probe is the case that
+// forces this: it enumerates as 2e8a:000c exactly like the RP2040-based one, so
+// nothing on the bus distinguishes them. flash.TargetUnknown clears the pin and
+// goes back to what discovery says.
+func (m *Manager) SetTargetOverride(id string, t flash.Target) error {
+	if err := m.store.SetDeviceTarget(id, t); err != nil {
+		return err
+	}
+	md := m.get(id, true) // a board may be classified while unplugged
+	// Reconcile re-derives this from the record on its next pass over a board
+	// that is on the bus; setting it here only saves the UI a poll interval.
+	// Clearing the pin on an absent board keeps showing the old value until the
+	// board is seen again, which is what every other field does too.
+	md.mu.Lock()
+	if t != flash.TargetUnknown {
+		md.desc.Target = t
+	}
+	md.mu.Unlock()
+	slog.Info("target override changed", "device", id, "target", t)
 	m.hub.Publish(sseMessage{Event: eventDevices})
 	m.poke()
 	return nil
@@ -667,6 +726,12 @@ func (md *managed) view() DeviceView {
 	if md.ring != nil {
 		v.RingText = md.ring.String()
 	}
+	if md.ocdRing != nil {
+		v.DebugLog = md.ocdRing.String()
+	}
+	if md.ocdSrv != nil {
+		v.DebugAddr = md.ocdSrv.Addr()
+	}
 	return v
 }
 
@@ -677,6 +742,13 @@ func (m *Manager) shutdown() {
 		mds = append(mds, md)
 	}
 	m.mu.Unlock()
+	// Stop debug sessions first: each holds md.ctrl, which detach needs, and
+	// an orphaned OpenOCD would keep the probe claimed after we exit.
+	for _, md := range mds {
+		if srv := md.debugServer(); srv != nil {
+			_ = srv.Stop()
+		}
+	}
 	for _, md := range mds {
 		m.detach(md)
 	}

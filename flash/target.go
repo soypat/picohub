@@ -15,6 +15,31 @@ const (
 	TargetESP32S3        // espflasher over serial, .bin
 )
 
+// Targets lists every board family a user may pick from, in display order.
+// TargetUnknown is not included: it means "whatever discovery said".
+func Targets() []Target {
+	return []Target{TargetPico, TargetPico2, TargetESP32C3, TargetESP32S3}
+}
+
+// ParseTarget resolves a family name as produced by Target.String. It reports
+// whether the name was known; "" and "unknown" both give TargetUnknown, which
+// is how a caller says "use the discovered family".
+func ParseTarget(s string) (Target, bool) {
+	switch s {
+	case "", "unknown":
+		return TargetUnknown, true
+	case "pico":
+		return TargetPico, true
+	case "pico2":
+		return TargetPico2, true
+	case "esp32c3":
+		return TargetESP32C3, true
+	case "esp32s3":
+		return TargetESP32S3, true
+	}
+	return TargetUnknown, false
+}
+
 // IsRP2 reports whether the target flashes via the RP2 BOOTSEL mass-storage flow.
 func (t Target) IsRP2() bool { return t == TargetPico || t == TargetPico2 }
 

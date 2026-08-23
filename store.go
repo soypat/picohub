@@ -35,7 +35,22 @@ type DeviceRecord struct {
 	// minicom) can own the port. The board is still listed and still tracked
 	// as present/absent by discovery.
 	Ignored bool `json:"ignored"`
+	// Debug is the OpenOCD configuration used when this board is served as a
+	// debug probe. A zero value means the defaults derived from the board's
+	// discovered target are used.
+	Debug DebugConfig `json:"debug"`
 }
+
+// DebugConfig is the persisted OpenOCD configuration for one probe. It is
+// policy only: the listen address and port are decided when a session starts.
+type DebugConfig struct {
+	Interface string `json:"interface"` // OpenOCD interface cfg name, e.g. "cmsis-dap"
+	Target    string `json:"target"`    // OpenOCD target cfg name, e.g. "rp2350"
+	SpeedKHz  int    `json:"speed_khz"` // adapter speed; 0 leaves OpenOCD's default
+}
+
+// Set reports whether the user has configured this device for debugging.
+func (c DebugConfig) Set() bool { return c.Interface != "" || c.Target != "" }
 
 // Session is one monitoring period for a device: from connect/flash until the
 // next flash or disconnect. The raw serial bytes are stored in LogFile on disk.
@@ -179,6 +194,18 @@ func (s *Store) SetDeviceName(id, name string) error {
 // DeviceRecord.Ignored.
 func (s *Store) SetDeviceIgnored(id string, ignored bool) error {
 	return s.updateDevice(id, func(rec *DeviceRecord) { rec.Ignored = ignored })
+}
+
+// SetDeviceTarget overrides the board family discovery inferred from VID/PID,
+// see DeviceRecord.TargetOverride. flash.TargetUnknown clears the override.
+func (s *Store) SetDeviceTarget(id string, t flash.Target) error {
+	return s.updateDevice(id, func(rec *DeviceRecord) { rec.TargetOverride = t })
+}
+
+// SetDeviceDebug stores the OpenOCD configuration for a device, see
+// DeviceRecord.Debug.
+func (s *Store) SetDeviceDebug(id string, cfg DebugConfig) error {
+	return s.updateDevice(id, func(rec *DeviceRecord) { rec.Debug = cfg })
 }
 
 // updateDevice applies fn to a device's record, creating it if the device has

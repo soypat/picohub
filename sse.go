@@ -43,6 +43,7 @@ const eventDevices = "devices"
 
 func consoleEvent(deviceID string) string { return "console:" + deviceID }
 func flashEvent(deviceID string) string   { return "flash:" + deviceID }
+func debugEvent(deviceID string) string   { return "debug:" + deviceID }
 
 // Subscribe registers a buffered channel on the stream and returns it plus an
 // unsubscribe function.

@@ -1,12 +1,16 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/a-h/templ"
 	"github.com/soypat/picohub/flash"
@@ -35,6 +39,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /devices/{id}/send", s.handleSend)
 	mux.HandleFunc("POST /devices/{id}/rename", s.handleRename)
 	mux.HandleFunc("POST /devices/{id}/ignore", s.handleIgnore)
+	mux.HandleFunc("POST /devices/{id}/target", s.handleTarget)
+	mux.HandleFunc("GET /devices/{id}/debug", s.handleDebugPage)
+	mux.HandleFunc("POST /devices/{id}/debug/config", s.handleDebugConfig)
+	mux.HandleFunc("POST /devices/{id}/debug/start", s.handleDebugStart)
+	mux.HandleFunc("POST /devices/{id}/debug/stop", s.handleDebugStop)
 	mux.HandleFunc("GET /devices/{id}/logs/{sid}", s.handleLog)
 	mux.HandleFunc("GET /devices/{id}/logs/{sid}/raw", s.handleLogRaw)
 	mux.HandleFunc("DELETE /devices/{id}/logs/{sid}", s.handleLogDelete)
@@ -261,6 +270,122 @@ func (s *Server) handleIgnore(w http.ResponseWriter, r *http.Request) {
 	// leaving stale buttons behind.
 	w.Header().Set("HX-Refresh", "true")
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleTarget pins a board's family when discovery cannot work it out from
+// VID/PID. An empty value clears the pin.
+func (s *Server) handleTarget(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.FormValue("target"))
+	target, ok := flash.ParseTarget(name)
+	if !ok {
+		http.Error(w, fmt.Sprintf("unknown board family %q", name), http.StatusBadRequest)
+		return
+	}
+	if err := s.mgr.SetTargetOverride(r.PathValue("id"), target); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// The device and debug pages both key off the family, so reload.
+	w.Header().Set("HX-Refresh", "true")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- debug handlers --------------------------------------------------------
+
+// handleDebugPage renders everything needed to debug a board from another
+// machine: what the probe is, how OpenOCD will be configured for it, and the
+// gdb command to paste once a session is running.
+func (s *Server) handleDebugPage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	d, ok := s.mgr.View(id)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	v := DebugPageView{
+		Device:  d,
+		Bind:    s.mgr.DebugBindAddr(),
+		GDBHost: requestHost(r),
+	}
+	cfg, err := s.mgr.DebugConfigFor(id)
+	if err != nil {
+		v.ConfigErr = err.Error()
+	}
+	v.Config = cfg
+	if rec, found, err := s.store.Device(id); err == nil && found {
+		v.TargetOverride = rec.TargetOverride
+	}
+	exe, scripts, version, err := s.mgr.DebugToolchain()
+	if err != nil {
+		v.OpenOCDErr = err.Error()
+	} else {
+		v.OpenOCDPath, v.OpenOCDScripts, v.OpenOCDVersion = exe, scripts, version
+	}
+	v.Running = d.DebugAddr != ""
+	if v.Running {
+		if _, port, err := net.SplitHostPort(d.DebugAddr); err == nil {
+			v.GDBAddr = net.JoinHostPort(v.GDBHost, port)
+		}
+	}
+	s.render(w, r, "Debug "+deviceName(d), debugPage(v))
+}
+
+// handleDebugConfig persists the OpenOCD configuration for a probe. The
+// manager validates it, so a bad name is a 400 here rather than a failed start
+// later.
+func (s *Server) handleDebugConfig(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	speed, err := strconv.Atoi(strings.TrimSpace(cmp.Or(r.FormValue("speed_khz"), "0")))
+	if err != nil || speed < 0 {
+		http.Error(w, "adapter speed must be a non-negative number of kHz", http.StatusBadRequest)
+		return
+	}
+	cfg := DebugConfig{
+		Interface: strings.TrimSpace(r.FormValue("interface")),
+		Target:    strings.TrimSpace(r.FormValue("target")),
+		SpeedKHz:  speed,
+	}
+	if err := s.mgr.SetDebugConfig(id, cfg); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("HX-Refresh", "true")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleDebugStart hands the probe to OpenOCD. The request context is not used
+// for the session: it bounds only the wait for OpenOCD to come up, and the
+// session outlives the request.
+func (s *Server) handleDebugStart(w http.ResponseWriter, r *http.Request) {
+	if err := s.mgr.StartDebug(r.Context(), r.PathValue("id")); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.Header().Set("HX-Refresh", "true")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleDebugStop(w http.ResponseWriter, r *http.Request) {
+	if err := s.mgr.StopDebug(r.PathValue("id")); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.Header().Set("HX-Refresh", "true")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// requestHost is the host the client used to reach picohub, which is the one a
+// remote gdb should be pointed at. It falls back to the wildcard so the
+// rendered command is still obviously a template rather than wrong.
+func requestHost(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		host = r.Host
+	}
+	if host == "" {
+		host = "<picohub-host>"
+	}
+	return host
 }
 
 // --- SSE handlers ----------------------------------------------------------
