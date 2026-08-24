@@ -5,7 +5,7 @@
 // Usage:
 //
 //	picoflash list
-//	picoflash flash [-id ID] <firmware.uf2>
+//	picoflash flash [-id ID] <firmware.uf2|.elf>
 //	picoflash bootmode [-id ID]
 package main
 
@@ -51,7 +51,7 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `usage:
   picoflash list
-  picoflash flash [-id ID] <firmware.uf2>
+  picoflash flash [-id ID] <firmware.uf2|.elf>
   picoflash bootmode [-id ID]
 `)
 	os.Exit(2)
@@ -89,15 +89,22 @@ func cmdFlash(ctx context.Context, args []string) error {
 	}
 	fwPath := fs.Arg(0)
 
-	if err := flash.ValidateUF2(fwPath); err != nil {
-		return fmt.Errorf("validate %s: %w", fwPath, err)
-	}
-	fi, err := os.Stat(fwPath)
+	// The board is picked first because converting an ELF needs to know which
+	// chip it is for.
+	desc, err := pickDevice(*id)
 	if err != nil {
 		return err
 	}
+	prepared, cleanup, err := flash.PrepareFirmware(fwPath, desc.Target)
+	if err != nil {
+		return fmt.Errorf("%s: %w", fwPath, err)
+	}
+	defer cleanup()
+	if prepared != fwPath {
+		fmt.Printf("converted %s to a %s UF2\n", fwPath, desc.Target)
+	}
 
-	desc, err := pickDevice(*id)
+	fi, err := os.Stat(prepared)
 	if err != nil {
 		return err
 	}
@@ -106,7 +113,7 @@ func cmdFlash(ctx context.Context, args []string) error {
 	dev := flash.NewDevice(desc)
 	defer dev.Close()
 
-	f, err := os.Open(fwPath)
+	f, err := os.Open(prepared)
 	if err != nil {
 		return err
 	}

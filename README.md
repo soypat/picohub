@@ -32,6 +32,25 @@ Mounting a Pico's BOOTSEL volume uses `udisksctl` (when a desktop session is
 present) with a `mount` fallback. Both need privilege, so on a headless box run
 picohub as **root** (see below).
 
+## Flashing
+
+Upload a **`.uf2`** and it is written to the board unchanged. Upload an
+**`.elf`** and picohub converts it first, the same way `tinygo build -o x.uf2`
+and [`picobin uf2conv`](https://github.com/soypat/tinyboot/tree/main/cmd/picobin)
+do: take the contiguous flash image the ELF describes and wrap it in UF2 blocks
+tagged with the chip's family id. The conversion is checked against TinyGo's own
+output byte-for-byte in `flash/elf_test.go`.
+
+What the upload *is* decides how it is treated, not what it is called — the ELF
+magic is what picohub looks at.
+
+The family id is taken from the board's family (`pico` -> `0xe48bff56`,
+`pico2` -> `0xe48bff59`), so if that is wrong the bootrom will refuse the image
+without saying why. Pin it on the debug page when discovery guesses wrong.
+
+Keep the ELF if you also plan to debug: a `.uf2` carries no symbols, and gdb
+needs the ELF (see below).
+
 ## Sharing a board with openocd (ignore)
 
 A board can be marked **ignored** from its device page ("Release board"). picohub
@@ -53,9 +72,10 @@ page) that turns the machine picohub runs on into a debug server: picohub
 supervises an `openocd` process for the probe and serves the GDB remote protocol
 on a TCP port. You run gdb on your own machine.
 
-The ELF never leaves your machine. gdb reads DWARF from a local copy and `load`
-writes flash through the remote protocol, so picohub does no ELF handling at all
-— it only needs `openocd` installed on the host.
+The ELF never leaves your machine for this. gdb reads DWARF from a local copy
+and `load` writes flash through the remote protocol, so nothing but the remote
+protocol crosses the network — the host only needs `openocd` installed. (This is
+separate from uploading an `.elf` to *flash*, above, which does send the file.)
 
 ```sh
 # on your machine, once a session is running
@@ -144,6 +164,10 @@ polkit rule or an `/etc/fstab` entry, which isn't worth the complexity here.
   the [cmd/picoflash](cmd/picoflash/) CLI or tests.
 - **Store** ([store.go](store.go)) keeps device/session/flash metadata in bbolt;
   raw serial bytes live as append-only per-session files under `-logs`.
+- **Firmware** ([flash/elf.go](flash/elf.go)) turns an uploaded `.elf` into a
+  UF2 for the board's chip, using `tinyboot/build/elfutil` to extract the flash
+  image and `tinyboot/build/uf2` to format it. `PrepareFirmware` is the one
+  entry point both the server and the CLI use.
 - **OCD** (the [ocd](ocd/) package) supervises an `openocd` process per probe:
   it builds and *validates* the command line (config names reach it from a web
   form, so they are rejected rather than escaped), waits for openocd's own

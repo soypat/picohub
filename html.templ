@@ -151,8 +151,14 @@ templ devicePage(d DeviceView, sessions []Session, flashes []FlashRecord) {
 				<p class="muted">ESP flashing is not yet supported (Phase 2). Console monitoring works.</p>
 			} else {
 				<form hx-post={ "/devices/" + d.ID + "/flash" } hx-encoding="multipart/form-data" hx-swap="none" class="col">
-					<input type="file" name="firmware" accept=".uf2" required/>
-					<button type="submit">Flash firmware (.uf2)</button>
+					<input type="file" name="firmware" accept=".uf2,.elf" required/>
+					<button type="submit">Flash firmware</button>
+					<span class="muted">
+						A <span class="mono">.uf2</span> is written as-is. An
+						<span class="mono">.elf</span> is converted for this board's chip
+						first &mdash; check the family badge above is right, since the
+						bootrom silently refuses an image built for the other one.
+					</span>
 				</form>
 			}
 			if !d.Ignored {
@@ -480,6 +486,13 @@ templ pageStyle() {
 		.badge.ok, .ok { color: #34d399; }
 		.badge.warn, .warn { color: #fbbf24; }
 		.badge.muted { color: #7a8290; }
+		details.help { margin-top: 14px; border: 1px solid #232838; border-radius: 6px; background: #12151d; }
+		details.help > summary { cursor: pointer; padding: 8px 12px; font-weight: 600; color: #9bb0d4; }
+		details.help[open] > summary { border-bottom: 1px solid #232838; }
+		.help-body { padding: 4px 14px 12px; }
+		.help-body h4 { margin: 16px 0 6px; font-size: 13px; color: #9bb0d4; }
+		.help-body ul { margin: 6px 0; padding-left: 20px; }
+		.help-body li { margin: 4px 0; }
 		.kv { border-collapse: collapse; margin-top: 10px; }
 		.kv td { padding: 3px 14px 3px 0; vertical-align: top; }
 		.kv td:first-child { color: #7a8290; white-space: nowrap; }
@@ -674,6 +687,7 @@ templ debugPage(v DebugPageView) {
 				<p class="err">{ v.Device.LastErr }</p>
 			}
 		}
+		@debugHelp(v)
 	</section>
 
 	<section class="panel">
@@ -681,4 +695,99 @@ templ debugPage(v DebugPageView) {
 		<pre id="debug-log" class="console flash-log">{ v.Device.DebugLog }</pre>
 		<div id="debug-sink" sse-swap={ debugEvent(v.Device.ID) } hx-swap="beforeend" hx-target="#debug-log"></div>
 	</section>
+}
+
+// debugHelp explains what a session does to a board that is already running
+// firmware, because the visible effect — the console going quiet — looks like a
+// crash and is not one.
+templ debugHelp(v DebugPageView) {
+	<details class="help">
+		<summary>What happens to a board that is already running?</summary>
+		<div class="help-body">
+			<p>
+				<strong>Your firmware keeps running.</strong> OpenOCD attaches over SWD and
+				enables the debug unit, but it does not halt, reset or erase the core:
+				immediately after attaching, OpenOCD reports the target as
+				<span class="mono">running</span>. Starting a session is not what stops a
+				program.
+			</p>
+			<p>
+				<strong>The console goes quiet, and that is picohub's doing.</strong> For as
+				long as the session lasts picohub closes the board's serial port and ends
+				the live log session, so output stops arriving and the log stops growing.
+				That is the change you see, and it looks exactly like a crash. Stop the
+				session and the console comes back — with a new log session, since the old
+				one was closed.
+			</p>
+			<p>
+				If the port picohub was reading is the board's own USB-CDC rather than a
+				probe's UART bridge, closing it also drops DTR. Firmware that blocks on a
+				host being connected can stall on that, which is a real stop rather than
+				just a quiet console.
+			</p>
+			<p>
+				<strong>What does stop your program is gdb.</strong>
+				<span class="mono">monitor halt</span> halts the core,
+				<span class="mono">load</span> overwrites flash with the ELF you passed, and
+				<span class="mono">monitor reset halt</span> restarts it at the reset vector.
+				The command shown above does all three, which is what you want when
+				flashing a fresh build and not what you want when inspecting a live one.
+			</p>
+			<p>
+				The board is also claimed for the session: flashing, boot mode and console
+				input are unavailable until it stops.
+			</p>
+
+			<h4>Attaching without disturbing it</h4>
+			<p class="muted">
+				Connect and leave the core alone — no <span class="mono">load</span>, no
+				<span class="mono">halt</span>. Use the ELF of the firmware that is
+				<em>already flashed</em>, or the symbols will not line up.
+			</p>
+			if v.Running {
+				@textDisplay("gdb-multiarch out.elf -ex \"target extended-remote "+v.GDBAddr+"\"", "gdb-attach-"+v.Device.ID+".sh")
+			}
+
+			<h4>Once you are in</h4>
+			<ul>
+				<li><span class="mono">Ctrl-C</span> &mdash; halt the running core and see where it is.</li>
+				<li><span class="mono">continue</span> &mdash; let it run again.</li>
+				<li><span class="mono">monitor reset halt</span> then <span class="mono">continue</span> &mdash; restart from the reset vector without reflashing.</li>
+				<li><span class="mono">monitor reset run</span> &mdash; restart and leave it running.</li>
+				<li><span class="mono">load</span> &mdash; flash the ELF you opened gdb with; follow it with <span class="mono">monitor reset halt</span>.</li>
+				<li><span class="mono">bt</span>, <span class="mono">info registers</span>, <span class="mono">x/16xw 0x20000000</span> &mdash; the usual once halted.</li>
+				<li><span class="mono">detach</span> then <span class="mono">quit</span> &mdash; leave gdb with the core still running.</li>
+			</ul>
+
+			<h4>Protips</h4>
+			<ul>
+				<li>
+					Build the ELF with debug information: <span class="mono">tinygo build</span>
+					keeps DWARF unless you pass <span class="mono">-no-debug</span>. A
+					<span class="mono">.uf2</span> has no symbols and cannot be used here.
+				</li>
+				<li>
+					To keep watching serial output while debugging, read the port from
+					something other than picohub &mdash; stop the session, or mark the board
+					ignored and use your own terminal. picohub will not share the port with
+					you.
+				</li>
+				<li>
+					Optimised builds single-step strangely and show
+					<span class="mono">&lt;optimized out&gt;</span> values. Build with
+					<span class="mono">-opt=1</span> when stepping matters more than speed.
+				</li>
+				<li>
+					A halted core stops servicing USB, so the board disappears from the bus
+					while you sit at a breakpoint. picohub will show it as absent; that is
+					expected and it comes back on <span class="mono">continue</span>.
+				</li>
+				<li>
+					If gdb connects but every read returns zeros or errors, the target config
+					is usually wrong for the chip &mdash; check the OpenOCD output panel for
+					the core it actually detected.
+				</li>
+			</ul>
+		</div>
+	</details>
 }

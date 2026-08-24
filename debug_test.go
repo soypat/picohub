@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -220,6 +222,13 @@ func TestDebugPageHTTP(t *testing.T) {
 	if strings.Contains(body, "extended-remote") {
 		t.Error("idle page should not offer a gdb command")
 	}
+	// The console going quiet is picohub's doing, not a crash. That has to be
+	// explained before you start a session, not only after.
+	for _, want := range []string{"<details", "already running", "keeps running"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("idle page missing help text %q", want)
+		}
+	}
 
 	if code := httpPost(t, ts.URL+"/devices/probe-1/debug/start"); code != http.StatusNoContent {
 		t.Fatalf("start returned %d", code)
@@ -240,6 +249,11 @@ func TestDebugPageHTTP(t *testing.T) {
 	}
 	if strings.Contains(body, "debug/start") {
 		t.Error("running page should not offer to start a second session")
+	}
+	// The attach-without-disturbing command is only useful once there is a port
+	// to attach to, so it appears only while running.
+	if !strings.Contains(body, "gdb-multiarch out.elf -ex &#34;target extended-remote "+net.JoinHostPort(host, "34100")) {
+		t.Error("running page missing the plain attach command")
 	}
 
 	if code := httpPost(t, ts.URL+"/devices/probe-1/debug/stop"); code != http.StatusNoContent {
@@ -356,6 +370,68 @@ func TestTargetOverrideHTTP(t *testing.T) {
 func httpPostForm(t *testing.T, url string, form url.Values) int {
 	t.Helper()
 	resp, err := http.PostForm(url, form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		t.Logf("POST %s: %s: %s", url, resp.Status, strings.TrimSpace(string(b)))
+	}
+	return resp.StatusCode
+}
+
+// The upload path has to accept an ELF and hand the manager a UF2, deciding
+// from the file's contents rather than its name.
+func TestFlashUploadAcceptsELF(t *testing.T) {
+	elfPath := filepath.Join("flash", "testdata", "blink-pico.elf")
+	if _, err := os.Stat(elfPath); err != nil {
+		t.Skipf("no testdata: %v", err)
+	}
+	store := newTestStore(t)
+	hub := NewHub()
+	m := NewManager(store, hub, time.Hour, 1024, DebugOptions{})
+	md := m.get("probe-1", true)
+	// Present but with no port, so the flash attempt fails after the upload has
+	// been accepted and converted — which is the part under test here.
+	md.observe(flash.Descriptor{ID: "probe-1", Target: flash.TargetPico, Present: true}, true, false)
+
+	ts := httptest.NewServer(NewServer(store, m, hub).Handler())
+	defer ts.Close()
+
+	// Uploaded under a name that says nothing, to prove the contents decide.
+	if code := postFirmware(t, ts.URL+"/devices/probe-1/flash", "firmware.bin", elfPath); code != http.StatusNoContent {
+		t.Errorf("uploading an ELF returned %d, want 204", code)
+	}
+
+	// Junk must still be refused.
+	junk := filepath.Join(t.TempDir(), "junk.uf2")
+	if err := os.WriteFile(junk, []byte("not firmware at all"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code := postFirmware(t, ts.URL+"/devices/probe-1/flash", "junk.uf2", junk); code != http.StatusBadRequest {
+		t.Errorf("uploading junk returned %d, want 400", code)
+	}
+}
+
+func postFirmware(t *testing.T, url, field, path string) int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	w, err := mw.CreateFormFile("firmware", field)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	mw.Close()
+
+	resp, err := http.Post(url, mw.FormDataContentType(), &buf)
 	if err != nil {
 		t.Fatal(err)
 	}

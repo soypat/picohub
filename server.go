@@ -198,7 +198,7 @@ func (s *Server) handleFlash(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	tmp, err := os.CreateTemp("", "picohub-fw-*.uf2")
+	tmp, err := os.CreateTemp("", "picohub-fw-*")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -212,16 +212,21 @@ func (s *Server) handleFlash(w http.ResponseWriter, r *http.Request) {
 	}
 	tmp.Close()
 
-	if err := flash.ValidateUF2(tmpName); err != nil {
+	// An ELF is converted to a UF2 for this board's target; a .uf2 is used as
+	// it arrived. What the upload actually is decides, not its filename.
+	fwPath, cleanup, err := flash.PrepareFirmware(tmpName, d.Target)
+	if err != nil {
 		os.Remove(tmpName)
-		http.Error(w, "invalid .uf2: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, "unusable firmware: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Flash asynchronously; progress + result stream over SSE.
+	// Flash asynchronously; progress + result stream over SSE. The history
+	// records the name the user uploaded, not the converted temporary.
 	go func() {
 		defer os.Remove(tmpName)
-		if err := s.mgr.Flash(context.Background(), id, tmpName, hdr.Filename); err != nil {
+		defer cleanup()
+		if err := s.mgr.Flash(context.Background(), id, fwPath, hdr.Filename); err != nil {
 			slog.Error("flash failed", "device", id, "err", err)
 		}
 	}()
